@@ -15,6 +15,7 @@ Please note that automatically retrying after being rejected because the server 
 
 # Discord RPC
 When RPC is enabled, server information such as the map name and score can be displayed in your Discord status(You need to enter the client ID in the RPC settings)
+
 <img width="346" height="133" alt="image" src="https://github.com/user-attachments/assets/684e2a1a-8a9d-4960-a485-d322c1510edc" />
 
 The **SAVE GSI CFG** button should only be used if Discord RPC does not work correctly.

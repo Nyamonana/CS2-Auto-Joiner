@@ -192,7 +192,7 @@ class ZeJoinerApp:
         header.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 8))
         tk.Label(
             header,
-            text="ZE JOINER",
+            text="CS2 Auto Joiner",
             bg=BG,
             fg=CYAN,
             font=("Segoe UI Black", 22, "bold"),

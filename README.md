@@ -1,1 +1,16 @@
-# CS2-Auto-Joiner
+﻿Usage
+Enter the server IP address in the TARGET field, select the refresh interval, and click the Join button.
+The tool will automatically connect to the server when an empty slot becomes available.
+
+Click the Scan button to retrieve the server information.
+
+If Notify Sound is enabled, a notification sound will play when the tool successfully connects to the server.
+
+The maximum request rate is limited to 3 requests per second because some servers may detect and block requests sent more frequently than that.
+
+Please note that automatically retrying after being rejected because the server is full was technically difficult to implement. In that case, please click the Join button again manually.
+
+The Save GSI CFG button should only be used if Discord RPC does not work correctly.
+If needed, click the button and place the generated CFG file manually.
+
+Normally, GSI is installed automatically when RPC is enabled, so you do not need to use this button.

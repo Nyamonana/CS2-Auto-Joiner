@@ -17,3 +17,11 @@ venv/
 /release/
 /.agents/
 /AI_NOTES.md
+
+# Private development files; README remains available for a new public version.
+/build.bat
+/build_windows.py
+/requirements-build.txt
+/cs2_joiner/build_check.py
+/tests/
+/CHANGELOG.md

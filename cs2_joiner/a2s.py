@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 import socket
 import struct
 import time
@@ -185,17 +186,28 @@ class A2SClient:
     def __init__(self, socket_factory=socket.socket):
         self._socket_factory = socket_factory
 
-    def query_info(self, address: ServerAddress, timeout: float = 0.15) -> ServerInfo:
+    def query_info(self, address: ServerAddress, timeout: float = 0.5) -> ServerInfo:
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("A2S timeout must be positive and finite.")
         started_at = time.perf_counter()
         with self._socket_factory(socket.AF_INET, socket.SOCK_DGRAM) as sock:
             sock.settimeout(timeout)
-            sock.sendto(A2S_INFO_REQUEST, address.endpoint())
-            data, _ = sock.recvfrom(4096)
-
-            if _is_challenge(data):
-                challenge = parse_challenge_response(data)
-                sock.sendto(A2S_INFO_REQUEST + challenge, address.endpoint())
-                data, _ = sock.recvfrom(4096)
+            # Connected UDP filters other senders. Each query has a fresh socket
+            # so a late response from a timed-out query cannot report a stale slot.
+            sock.connect(address.endpoint())
+            request = A2S_INFO_REQUEST
+            for _ in range(4):
+                remaining = timeout - (time.perf_counter() - started_at)
+                if remaining <= 0:
+                    raise TimeoutError("A2S query timed out.")
+                sock.settimeout(remaining)
+                sock.send(request)
+                data = sock.recv(65535)
+                if not _is_challenge(data):
+                    break
+                request = A2S_INFO_REQUEST + parse_challenge_response(data)
+            else:
+                raise A2SProtocolError("Too many A2S challenge responses.")
 
         ping_ms = (time.perf_counter() - started_at) * 1000.0
         return parse_info_response(data, ping_ms=ping_ms)

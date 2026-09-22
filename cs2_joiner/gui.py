@@ -9,25 +9,32 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 from .a2s import A2SClient, ServerAddress, ServerInfo, parse_server_address
+from .audio_mute import ProcessMuteResult, TARGET_PROCESS_NAME, toggle_process_mute
 from .autojoin import AutoJoinEvent, AutoJoinSettings, AutoJoinWorker, format_server_scan_message
+from .connection import ConsoleLogObserver
 from .debug_log import DebugLogger, mask_client_id
 from .discord_rpc import (
     DiscordRpcConfig,
     DiscordRpcWorker,
     DiscordRpcWorkerEvent,
     build_activity_from_presence_state,
-    format_details,
-    format_map_line,
-    format_players,
     format_score,
     load_discord_config,
     save_discord_config,
 )
 from .gsi import GsiServer, GsiSnapshot, build_gsi_config, find_cs2_cfg_dirs, install_gsi_config
+from .paths import application_directory
+from .log_cleanup import CleanupResult, LogCleanupManager
 from .server_monitor import ServerMonitorEvent, ServerMonitorSettings, ServerMonitorWorker
 from .server_target import (
     SoundSettings,
     load_request_rate,
+    load_console_log_path,
+    load_auto_retry_enabled,
+    save_auto_retry_enabled,
+    save_console_log_path,
+    load_log_cleanup_enabled,
+    save_log_cleanup_enabled,
     load_saved_server_address,
     load_sound_settings,
     save_request_rate,
@@ -36,17 +43,9 @@ from .server_target import (
 )
 from .sound import SoundPlayer, discover_sound_files, play_notification_sound
 from .steam import SteamLauncher
+from .ui import BG, PANEL, PANEL_2, TEXT, MUTED, GREEN, JoinerLayout
 
 
-BG = "#070a0f"
-PANEL = "#101720"
-PANEL_2 = "#151f2b"
-TEXT = "#dce7f2"
-MUTED = "#7f91a3"
-CYAN = "#2ee8ff"
-GREEN = "#7dff91"
-RED = "#ff4d6d"
-AMBER = "#ffd166"
 DEFAULT_WIDTH = 1280
 DEFAULT_HEIGHT = 900
 MIN_WIDTH = 1120
@@ -55,23 +54,21 @@ SCREEN_MARGIN = 40
 DISCORD_PENDING_RESEND_SECONDS = 2.0
 DISCORD_LIVE_RESEND_SECONDS = 15.0
 DISCORD_SERVER_REFRESH_SECONDS = 10.0
-PREVIEW_MIN_WRAP_LENGTH = 120
+GSI_MAX_AGE_SECONDS = 45.0
+A2S_MAX_AGE_SECONDS = 30.0
 
 
-class ZeJoinerApp:
+class ZeJoinerApp(JoinerLayout):
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("CS2 Auto Joiner")
-        icon_path = Path(__file__).resolve().parent.parent / "assets" / "ze_joiner.ico"
-        if icon_path.exists():
-            self.root.iconbitmap(str(icon_path))
+        self.root.title("CS2 Joiner")
         self._configure_window()
         self.root.configure(bg=BG)
 
         self.client = A2SClient()
         self.launcher = SteamLauncher()
-        self.sound_dir = Path(__file__).resolve().parent.parent / "sound"
-        self.config_path = Path(__file__).resolve().parent.parent / "ze_joiner.ini"
+        self.sound_dir = application_directory() / "sound"
+        self.config_path = application_directory() / "ze_joiner.ini"
         self.debug_logger = DebugLogger()
         self.debug_logger.log("app", "startup", config_path=str(self.config_path), sound_dir=str(self.sound_dir))
         self.sound_player = SoundPlayer()
@@ -81,22 +78,40 @@ class ZeJoinerApp:
         self.discord_config = load_discord_config(self.config_path)
         self.saved_server_address = load_saved_server_address(self.config_path)
         self.saved_request_rate = load_request_rate(self.config_path)
+        saved_log = load_console_log_path(self.config_path)
+        candidates = [directory.parent / "console.log" for directory in find_cs2_cfg_dirs()]
+        self.console_log_path = Path(saved_log) if saved_log else next((path for path in candidates if path.is_file()), None)
         self.discord_worker: DiscordRpcWorker | None = None
+        self._retiring_rpc_workers: list[DiscordRpcWorker] = []
         self.server_monitor: ServerMonitorWorker | None = None
         self.current_server_address: ServerAddress | None = None
         self.latest_server_info_address: ServerAddress | None = None
         self.latest_server_info: ServerInfo | None = None
         self.latest_gsi_snapshot: GsiSnapshot | None = None
+        self._gsi_received_at = 0.0
+        self._server_received_at = 0.0
         self.last_discord_activity_key = ""
         self.last_discord_queue_time = 0.0
         self.worker: AutoJoinWorker | None = None
         self.gsi_server: GsiServer | None = None
         self.events: queue.Queue[AutoJoinEvent | tuple[str, object]] = queue.Queue()
+        self._closed = False
+        self._scan_generation = 0
+        self._auto_generation = 0
+        self._monitor_generation = 0
+        self._rpc_generation = 0
+        self._cleanup_manager = LogCleanupManager()
+        self._cleanup_busy = False
+        self._cleanup_cancel = threading.Event()
+        self._cleanup_generation = 0
+        self._cleanup_last_message = ""
 
         self.address_var = tk.StringVar(value=self.saved_server_address)
         self.request_rate_var = tk.IntVar(value=self.saved_request_rate)
         self.threshold_var = tk.IntVar(value=63)
-        self.timeout_var = tk.DoubleVar(value=0.15)
+        self.auto_retry_var = tk.BooleanVar(value=load_auto_retry_enabled(self.config_path))
+        self.log_cleanup_var = tk.BooleanVar(value=load_log_cleanup_enabled(self.config_path))
+        self.timeout_var = tk.DoubleVar(value=0.5)
         self.sound_enabled_var = tk.BooleanVar(value=bool(self.sound_files) and self.sound_settings.enabled)
         self.sound_choice_var = tk.StringVar(value=self._initial_sound_choice())
         self.discord_client_id_var = tk.StringVar(value=self.discord_config.client_id)
@@ -121,6 +136,8 @@ class ZeJoinerApp:
         self._poll_events()
         self.root.protocol("WM_DELETE_WINDOW", self._close)
         self.root.after(100, self._restore_discord_rpc)
+        self.root.after(1000, self._refresh_presence)
+        self.root.after(10000, self._check_log_cleanup)
 
     def _configure_window(self) -> None:
         screen_width = self.root.winfo_screenwidth()
@@ -138,309 +155,6 @@ class ZeJoinerApp:
             except tk.TclError:
                 return
 
-    def _build_style(self) -> None:
-        style = ttk.Style()
-        style.theme_use("clam")
-        style.configure("TEntry", fieldbackground=PANEL_2, foreground=TEXT, insertcolor=TEXT)
-        style.configure("TSpinbox", fieldbackground=PANEL_2, foreground=TEXT, insertcolor=TEXT)
-        style.configure("TCombobox", fieldbackground=PANEL_2, foreground=TEXT, arrowcolor=CYAN)
-        style.configure("TRadiobutton", background=PANEL, foreground=TEXT)
-        style.map("TRadiobutton", background=[("active", PANEL)], foreground=[("active", CYAN)])
-
-    def _build_layout(self) -> None:
-        outer = tk.Frame(self.root, bg=BG)
-        outer.pack(fill="both", expand=True)
-        canvas = tk.Canvas(outer, bg=BG, highlightthickness=0, bd=0)
-        scrollbar = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
-        canvas.configure(yscrollcommand=scrollbar.set)
-        canvas.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
-
-        shell = tk.Frame(canvas, bg=BG)
-        shell_window = canvas.create_window((0, 0), window=shell, anchor="nw")
-        shell.configure(padx=14, pady=10)
-
-        def sync_canvas(event: tk.Event | None = None) -> None:
-            if event is not None and event.widget is canvas:
-                canvas.itemconfigure(shell_window, width=event.width)
-            canvas_height = canvas.winfo_height()
-            requested_height = shell.winfo_reqheight()
-            canvas.itemconfigure(shell_window, height=max(canvas_height, requested_height))
-            canvas.configure(scrollregion=canvas.bbox("all"))
-
-        def is_child_of(widget: tk.Widget, parent: tk.Widget) -> bool:
-            while widget is not None:
-                if widget is parent:
-                    return True
-                widget = widget.master
-            return False
-
-        def scroll_canvas(event: tk.Event) -> None:
-            log = getattr(self, "log", None)
-            if log is not None and is_child_of(event.widget, log):
-                return
-            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-
-        shell.bind("<Configure>", sync_canvas)
-        canvas.bind("<Configure>", sync_canvas)
-        canvas.bind_all("<MouseWheel>", scroll_canvas)
-        shell.grid_columnconfigure(0, weight=1)
-        shell.grid_columnconfigure(1, weight=1)
-        shell.grid_rowconfigure(2, weight=1)
-
-        header = tk.Frame(shell, bg=BG)
-        header.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 8))
-        tk.Label(
-            header,
-            text="CS2 Auto Joiner",
-            bg=BG,
-            fg=CYAN,
-            font=("Segoe UI Black", 22, "bold"),
-        ).pack(side="left")
-        self.status_chip = tk.Label(
-            header,
-            textvariable=self.status_var,
-            bg=PANEL_2,
-            fg=GREEN,
-            font=("Consolas", 11, "bold"),
-            padx=12,
-            pady=4,
-        )
-        self.status_chip.pack(side="right")
-
-        left = self._panel(shell)
-        right = self._panel(shell)
-        left.grid(row=1, column=0, sticky="nsew", padx=(0, 10))
-        right.grid(row=1, column=1, sticky="nsew", padx=(10, 0))
-        left.grid_columnconfigure(0, weight=1)
-        right.grid_columnconfigure(0, weight=1)
-
-        self._build_controls(left)
-        self._build_server_status(right)
-        self._build_gsi_status(right)
-        self._build_log(shell)
-
-    def _build_controls(self, parent: tk.Frame) -> None:
-        self._title(parent, "TARGET")
-        entry = ttk.Entry(parent, textvariable=self.address_var, font=("Consolas", 13))
-        entry.grid(row=1, column=0, sticky="ew", padx=14, pady=(0, 9), ipady=5)
-        entry.insert(0, "")
-
-        rate_box = tk.Frame(parent, bg=PANEL)
-        rate_box.grid(row=2, column=0, sticky="ew", padx=14, pady=(0, 8))
-        tk.Label(rate_box, text="REQUEST RATE", bg=PANEL, fg=MUTED, font=("Segoe UI", 9, "bold")).pack(anchor="w")
-        row = tk.Frame(rate_box, bg=PANEL)
-        row.pack(fill="x", pady=(5, 0))
-        for value in (1, 2, 3):
-            button = tk.Radiobutton(
-                row,
-                text=f"{value} / sec",
-                variable=self.request_rate_var,
-                value=value,
-                command=self._save_request_rate,
-                indicatoron=False,
-                selectcolor=CYAN,
-                bg=PANEL_2,
-                fg=TEXT,
-                activebackground=CYAN,
-                activeforeground=BG,
-                font=("Consolas", 12, "bold"),
-                padx=14,
-                pady=6,
-                bd=0,
-            )
-            button.pack(side="left", expand=True, fill="x", padx=(0, 8))
-
-        options = tk.Frame(parent, bg=PANEL)
-        options.grid(row=3, column=0, sticky="ew", padx=14, pady=(0, 9))
-        options.grid_columnconfigure(1, weight=1)
-        tk.Label(options, text="JOIN AT", bg=PANEL, fg=MUTED, font=("Segoe UI", 9, "bold")).grid(row=0, column=0, sticky="w")
-        threshold = ttk.Spinbox(options, from_=0, to=128, textvariable=self.threshold_var, width=8, font=("Consolas", 12))
-        threshold.grid(row=1, column=0, sticky="w", pady=(5, 0), ipady=4)
-        tk.Label(options, text="players or less", bg=PANEL, fg=TEXT, font=("Segoe UI", 11)).grid(
-            row=1, column=1, sticky="w", padx=(10, 0), pady=(5, 0)
-        )
-
-        actions = tk.Frame(parent, bg=PANEL)
-        actions.grid(row=4, column=0, sticky="ew", padx=14, pady=(0, 9))
-        actions.grid_columnconfigure(0, weight=1)
-        actions.grid_columnconfigure(1, weight=1)
-        actions.grid_columnconfigure(2, weight=1)
-        self.scan_button = self._button(actions, "SCAN", self.scan_once, CYAN, BG)
-        self.join_button = self._button(actions, "JOIN", self.join_now, GREEN, BG)
-        self.stop_button = self._button(actions, "STOP", self.stop_auto_join, RED, "#ffffff")
-        self.scan_button.grid(row=0, column=0, sticky="ew", padx=(0, 6))
-        self.join_button.grid(row=0, column=1, sticky="ew", padx=6)
-        self.stop_button.grid(row=0, column=2, sticky="ew", padx=(6, 0))
-
-        cfg = tk.Frame(parent, bg=PANEL)
-        cfg.grid(row=5, column=0, sticky="ew", padx=14, pady=(0, 9))
-        cfg.grid_columnconfigure(0, weight=1)
-        self.cfg_button = self._button(cfg, "SAVE GSI CFG", self.save_gsi_config, PANEL_2, TEXT)
-        self.cfg_button.grid(row=0, column=0, sticky="ew")
-
-    def _build_server_status(self, parent: tk.Frame) -> None:
-        self._title(parent, "SERVER")
-        grid = tk.Frame(parent, bg=PANEL)
-        grid.grid(row=1, column=0, sticky="ew", padx=14, pady=(0, 9))
-        grid.grid_columnconfigure(1, weight=1)
-        self._metric(grid, 0, "NAME", self.server_var)
-        self._metric(grid, 1, "MAP", self.map_var)
-        self._metric(grid, 2, "PLAYERS", self.players_var)
-        self._metric(grid, 3, "PING", self.ping_var)
-
-    def _build_gsi_status(self, parent: tk.Frame) -> None:
-        self._title(parent, "GSI / PRESENCE", row=2)
-        grid = tk.Frame(parent, bg=PANEL)
-        grid.grid(row=3, column=0, sticky="ew", padx=14, pady=(0, 9))
-        grid.grid_columnconfigure(1, weight=1)
-        self._metric(grid, 0, "GSI", self.gsi_status_var)
-        self._metric(grid, 1, "LOCAL MAP", self.gsi_map_var)
-        self._metric(grid, 2, "SCORE", self.gsi_score_var)
-        self._metric(grid, 3, "PREVIEW", self.presence_var, wrap=True)
-        self._metric(grid, 4, "DISCORD RPC", self.discord_status_var)
-
-        rpc = tk.Frame(grid, bg=PANEL)
-        rpc.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(5, 0))
-        rpc.grid_columnconfigure(1, weight=1)
-        tk.Label(rpc, text="RPC", bg=PANEL, fg=MUTED, font=("Segoe UI", 9, "bold")).grid(
-            row=0, column=0, sticky="w", padx=(0, 10)
-        )
-        self.rpc_settings_button = self._button(rpc, "RPC SETTING", self.open_rpc_settings, PANEL_2, TEXT)
-        self.rpc_settings_button.configure(width=14)
-        self.rpc_settings_button.grid(row=0, column=1, sticky="ew", padx=(0, 8))
-        self.discord_toggle = tk.Checkbutton(
-            rpc,
-            command=self.toggle_discord_rpc,
-            indicatoron=False,
-            variable=self.discord_enabled_var,
-            bd=0,
-            font=("Segoe UI", 10, "bold"),
-            padx=12,
-            pady=6,
-            cursor="hand2",
-            width=9,
-        )
-        self.discord_toggle.grid(row=0, column=2, sticky="ew")
-        self._update_discord_toggle()
-
-    def _build_log(self, parent: tk.Frame) -> None:
-        log_panel = self._panel(parent)
-        log_panel.grid(row=2, column=0, columnspan=2, sticky="nsew", pady=(8, 0))
-        log_panel.grid_columnconfigure(0, weight=1)
-        log_panel.grid_rowconfigure(2, weight=1)
-        self._title(log_panel, "LOG")
-        self._build_sound_controls(log_panel)
-        log_body = tk.Frame(log_panel, bg="#05070b")
-        log_body.grid(row=2, column=0, sticky="nsew", padx=14, pady=(0, 12))
-        log_body.grid_columnconfigure(0, weight=1)
-        log_body.grid_rowconfigure(0, weight=1)
-        self.log = tk.Text(
-            log_body,
-            height=8,
-            bg="#05070b",
-            fg=TEXT,
-            insertbackground=TEXT,
-            relief="flat",
-            font=("Consolas", 10),
-            wrap="word",
-        )
-        log_scrollbar = ttk.Scrollbar(log_body, orient="vertical", command=self.log.yview)
-        self.log.configure(yscrollcommand=log_scrollbar.set)
-        self.log.grid(row=0, column=0, sticky="nsew")
-        log_scrollbar.grid(row=0, column=1, sticky="ns")
-        self.log.configure(state="disabled")
-
-    def _build_sound_controls(self, parent: tk.Frame) -> None:
-        sound = tk.Frame(parent, bg=PANEL)
-        sound.grid(row=1, column=0, sticky="ew", padx=14, pady=(0, 6))
-        sound.grid_columnconfigure(0, weight=0, minsize=120)
-        sound.grid_columnconfigure(1, weight=0, minsize=132)
-        sound.grid_columnconfigure(2, weight=1, minsize=260)
-        sound.grid_columnconfigure(3, weight=0, minsize=96)
-        sound.grid_columnconfigure(4, weight=0, minsize=96)
-
-        tk.Label(sound, text="NOTIFY SOUND", bg=PANEL, fg=MUTED, font=("Segoe UI", 9, "bold")).grid(
-            row=0, column=0, sticky="w", padx=(0, 8)
-        )
-        self.sound_toggle = tk.Checkbutton(
-            sound,
-            command=self._toggle_sound,
-            indicatoron=False,
-            variable=self.sound_enabled_var,
-            bd=0,
-            font=("Segoe UI", 10, "bold"),
-            padx=12,
-            pady=6,
-            cursor="hand2",
-            width=12,
-        )
-        self.sound_toggle.grid(row=0, column=1, sticky="ew", padx=(0, 8))
-        self.sound_combo = ttk.Combobox(
-            sound,
-            textvariable=self.sound_choice_var,
-            values=self._sound_choice_values(),
-            state="readonly" if self.sound_files else "disabled",
-            font=("Consolas", 11),
-            width=24,
-        )
-        self.sound_combo.grid(row=0, column=2, sticky="ew", ipady=4, padx=(0, 8))
-        self.sound_combo.bind("<<ComboboxSelected>>", lambda event: self._save_sound_settings())
-        self.refresh_sound_button = self._button(sound, "REFRESH", self.refresh_sound_files, PANEL_2, TEXT)
-        self.refresh_sound_button.configure(width=9)
-        self.refresh_sound_button.grid(row=0, column=3, sticky="ew", padx=(0, 8))
-        self.preview_button = self._button(sound, "PREVIEW", self.preview_sound, PANEL_2, TEXT)
-        self.preview_button.configure(width=9)
-        self.preview_button.grid(row=0, column=4, sticky="ew")
-        if not self.sound_files:
-            self.preview_button.configure(state="disabled")
-        self._update_sound_toggle()
-
-    def _panel(self, parent: tk.Widget) -> tk.Frame:
-        return tk.Frame(parent, bg=PANEL, highlightbackground="#223244", highlightthickness=1)
-
-    def _title(self, parent: tk.Frame, text: str, row: int = 0) -> None:
-        tk.Label(parent, text=text, bg=PANEL, fg=CYAN, font=("Segoe UI", 11, "bold")).grid(
-            row=row, column=0, sticky="w", padx=14, pady=(8, 5)
-        )
-
-    def _metric(self, parent: tk.Frame, row: int, label: str, variable: tk.StringVar, wrap: bool = False) -> None:
-        tk.Label(parent, text=label, bg=PANEL, fg=MUTED, font=("Segoe UI", 9, "bold")).grid(
-            row=row, column=0, sticky="w", pady=3
-        )
-        value = tk.Label(
-            parent,
-            textvariable=variable,
-            bg=PANEL,
-            fg=TEXT,
-            font=("Consolas", 11, "bold"),
-            anchor="w",
-            justify="left",
-        )
-        if wrap:
-            value.configure(width=1, wraplength=PREVIEW_MIN_WRAP_LENGTH)
-            value.bind(
-                "<Configure>",
-                lambda event: value.configure(wraplength=max(PREVIEW_MIN_WRAP_LENGTH, event.width - 4)),
-            )
-        value.grid(row=row, column=1, sticky="ew", padx=(12, 0), pady=3)
-
-    def _button(self, parent: tk.Frame, text: str, command, bg: str, fg: str) -> tk.Button:
-        return tk.Button(
-            parent,
-            text=text,
-            command=command,
-            bg=bg,
-            fg=fg,
-            activebackground=TEXT,
-            activeforeground=BG,
-            bd=0,
-            relief="flat",
-            font=("Segoe UI", 10, "bold"),
-            padx=10,
-            pady=8,
-            cursor="hand2",
-        )
 
     def scan_once(self) -> None:
         self._debug("scan requested", raw_address=self.address_var.get())
@@ -451,18 +165,22 @@ class ZeJoinerApp:
             self._show_error(str(exc))
             return
 
+        if self.worker is not None and self.worker.is_running:
+            return
         self._set_current_server_address(address, "scan")
         self._debug("scan parsed address", address=str(address))
         self.status_var.set("SCANNING")
-        threading.Thread(target=self._scan_thread, args=(address,), daemon=True).start()
+        self._scan_generation += 1
+        self.scan_button.configure(state="disabled")
+        threading.Thread(target=self._scan_thread, args=(address, self._scan_generation), daemon=True).start()
 
-    def _scan_thread(self, address) -> None:
+    def _scan_thread(self, address, generation: int) -> None:
         self._debug("scan thread start", address=str(address))
         try:
             info = self.client.query_info(address)
         except Exception as exc:
             self._debug("scan thread failed", address=str(address), error=repr(exc))
-            self.events.put(("scan_error", str(exc)))
+            self.events.put(("scan_error", (generation, address, str(exc))))
         else:
             self._debug(
                 "scan thread ok",
@@ -473,19 +191,17 @@ class ZeJoinerApp:
                 max_players=info.max_players,
                 ping_ms=info.ping_ms,
             )
-            self.events.put(("scan_info", info))
+            self.events.put(("scan_info", (generation, address, info)))
 
     def join_now(self) -> None:
         self.start_auto_join()
 
     def start_auto_join(self) -> None:
-        self._debug(
-            "auto join requested",
-            raw_address=self.address_var.get(),
-            request_rate=self.request_rate_var.get(),
-            threshold=self.threshold_var.get(),
-            timeout=self.timeout_var.get(),
-        )
+        if self._cleanup_busy:
+            self._log("Log cleanup is finishing. Please press JOIN again shortly.")
+            return
+        if self.worker is not None and self.worker.is_running:
+            return
         try:
             address = parse_server_address(self.address_var.get())
             settings = AutoJoinSettings(
@@ -493,6 +209,7 @@ class ZeJoinerApp:
                 requests_per_second=self.request_rate_var.get(),
                 threshold_players=int(self.threshold_var.get()),
                 timeout_seconds=float(self.timeout_var.get()),
+                auto_retry_enabled=self.auto_retry_var.get(),
             )
         except (ValueError, tk.TclError) as exc:
             self._debug("auto join settings failed", error=str(exc))
@@ -500,9 +217,17 @@ class ZeJoinerApp:
             return
 
         self._save_request_rate()
+        self._cleanup_generation += 1
         self._set_current_server_address(address, "join")
-        self.stop_auto_join()
-        self.worker = AutoJoinWorker(self.client, self.launcher.join_server, settings, self.events.put)
+        self._scan_generation += 1
+        self._stop_server_monitor()
+        self._auto_generation += 1
+        generation = self._auto_generation
+        self.worker = AutoJoinWorker(
+            self.client, self.launcher.join_server, settings,
+            lambda event: self.events.put(("auto", (generation, event))),
+            connection_observer=ConsoleLogObserver(self.console_log_path) if self.console_log_path else None,
+        )
         self.worker.start()
         self._debug("auto join worker started", address=str(address), request_rate=settings.requests_per_second)
         self._set_auto_buttons(is_running=True)
@@ -511,6 +236,79 @@ class ZeJoinerApp:
         if self.worker is not None and self.worker.is_running:
             self.worker.stop()
             self._debug("auto join stop requested")
+
+    def toggle_auto_retry(self) -> None:
+        enabled = self.auto_retry_var.get()
+        if self.worker is not None:
+            self.worker.set_auto_retry_enabled(enabled)
+        try:
+            save_auto_retry_enabled(self.config_path, enabled)
+        except OSError as exc:
+            self._log(f"Could not save auto retry setting: {exc}")
+        self._log(f"Auto retry: {'ON' if enabled else 'OFF'}")
+
+    def choose_console_log(self) -> None:
+        if self._cleanup_busy:
+            return
+        path = filedialog.askopenfilename(
+            title="Select CS2 console.log", filetypes=[("CS2 console log", "*.log"), ("All files", "*.*")],
+            initialdir=str(self.console_log_path.parent) if self.console_log_path else None,
+        )
+        if path:
+            self._cleanup_generation += 1
+            self.console_log_path = Path(path)
+            try:
+                save_console_log_path(self.config_path, self.console_log_path)
+            except OSError as exc:
+                self._log(f"Could not save log selection: {exc}")
+            self._log(f"CS2 connection log: {self.console_log_path}")
+
+    def toggle_log_cleanup(self) -> None:
+        enabled = self.log_cleanup_var.get()
+        self._cleanup_generation += 1
+        if not enabled:
+            self._cleanup_cancel.set()
+        try:
+            save_log_cleanup_enabled(self.config_path, enabled)
+        except OSError as exc:
+            self._log(f"Could not save auto clean setting: {exc}")
+        self._log(f"Auto clean log: {'ON (after CS2 stops; over 50 MiB, keep last 5 MiB)' if enabled else 'OFF'}")
+
+    def _check_log_cleanup(self) -> None:
+        if self._closed:
+            return
+        self.root.after(10000, self._check_log_cleanup)
+        if (not self.log_cleanup_var.get() or self._cleanup_busy
+                or self.console_log_path is None or (self.worker is not None and self.worker.is_running)):
+            return
+        self._cleanup_busy = True
+        self._cleanup_cancel = threading.Event()
+        self.join_button.configure(state="disabled")
+        self.console_log_button.configure(state="disabled")
+        thread = threading.Thread(
+            target=self._cleanup_log_thread,
+            args=(self.console_log_path, self._cleanup_cancel, self._cleanup_generation),
+            name="cs2-log-cleanup", daemon=False,
+        )
+        try:
+            thread.start()
+        except RuntimeError as exc:
+            self._handle_cleanup_result(CleanupResult("error", f"Auto clean could not start: {exc}"))
+
+    def _cleanup_log_thread(self, path: Path, cancelled: threading.Event, generation: int) -> None:
+        try:
+            result = self._cleanup_manager.check(path, cancelled, generation)
+        except Exception as exc:
+            result = CleanupResult("error", f"Auto clean failed: {exc}")
+        self.events.put(("log_cleanup", result))
+
+    def _handle_cleanup_result(self, result: CleanupResult) -> None:
+        self._cleanup_busy = False
+        self.console_log_button.configure(state="normal")
+        self.join_button.configure(state="disabled" if self.worker is not None and self.worker.is_running else "normal")
+        if result.message and result.message != self._cleanup_last_message:
+            self._log(result.message)
+        self._cleanup_last_message = result.message
 
     def refresh_sound_files(self) -> None:
         previous_choice = self.sound_choice_var.get()
@@ -590,6 +388,19 @@ class ZeJoinerApp:
         with open(path, "w", encoding="utf-8") as file:
             file.write(build_gsi_config(uri=uri))
         self._debug("gsi config saved", path=path, uri=uri)
+
+    def toggle_cs2_mute(self) -> None:
+        self._debug("cs2 mute toggle requested", target=TARGET_PROCESS_NAME)
+        self._set_cs2_mute_button_busy()
+        threading.Thread(target=self._toggle_cs2_mute_thread, name="cs2-audio-mute", daemon=True).start()
+
+    def _toggle_cs2_mute_thread(self) -> None:
+        try:
+            result = toggle_process_mute(TARGET_PROCESS_NAME)
+        except Exception as exc:
+            self.events.put(("cs2_mute_error", str(exc)))
+        else:
+            self.events.put(("cs2_mute", result))
 
     def _install_gsi_config(self, uri: str) -> None:
         result = install_gsi_config(uri=uri)
@@ -681,22 +492,34 @@ class ZeJoinerApp:
 
         self._start_gsi_receiver(show_error=False)
         self._disconnect_discord_rpc(save_enabled=False)
+        self.discord_status_var.set("CONNECTING")
+        self._save_discord_settings(enabled=True)
+        self._start_discord_when_stopped(client_id, self._rpc_generation)
+
+    def _start_discord_when_stopped(self, client_id: str, generation: int) -> None:
+        if self._closed or generation != self._rpc_generation or not self.discord_enabled_var.get():
+            return
+        self._retiring_rpc_workers = [worker for worker in self._retiring_rpc_workers if worker.is_running]
+        if self._retiring_rpc_workers:
+            self.root.after(50, lambda: self._start_discord_when_stopped(client_id, generation))
+            return
         self.discord_worker = DiscordRpcWorker(
-            on_event=lambda event: self.events.put(("discord", event)),
+            on_event=lambda event, generation=self._rpc_generation: self.events.put(("discord", (generation, event))),
             debug_logger=self.debug_logger,
         )
         self.discord_worker.start(client_id)
         self.discord_status_var.set("CONNECTING")
         self.last_discord_activity_key = ""
         self.last_discord_queue_time = 0.0
-        self._save_discord_settings(enabled=True)
         self._start_server_monitor_if_possible("rpc-on")
         self._sync_discord_current_activity("rpc-on")
 
     def _disconnect_discord_rpc(self, save_enabled: bool = True) -> None:
+        self._rpc_generation += 1
         self._debug("discord disconnect requested", save_enabled=save_enabled, has_worker=self.discord_worker is not None)
         if self.discord_worker is not None:
             self.discord_worker.clear_and_stop()
+            self._retiring_rpc_workers.append(self.discord_worker)
 
         self.discord_worker = None
         self.last_discord_activity_key = ""
@@ -727,13 +550,22 @@ class ZeJoinerApp:
             self._debug("request rate save failed", error=repr(exc))
 
     def _poll_events(self) -> None:
-        while True:
-            try:
-                event = self.events.get_nowait()
-            except queue.Empty:
-                break
-            self._handle_event(event)
-        self.root.after(50, self._poll_events)
+        if self._closed:
+            return
+        try:
+            for _ in range(100):
+                try:
+                    event = self.events.get_nowait()
+                except queue.Empty:
+                    break
+                try:
+                    self._handle_event(event)
+                except Exception as exc:
+                    self._debug("event handler failed", error=repr(exc))
+                    self._log(f"Event processing failed: {exc}")
+        finally:
+            if not self._closed:
+                self.root.after(50, self._poll_events)
 
     def _handle_event(self, event: AutoJoinEvent | tuple[str, object]) -> None:
         if isinstance(event, AutoJoinEvent):
@@ -741,15 +573,31 @@ class ZeJoinerApp:
             return
 
         kind, payload = event
-        if kind == "scan_info" and isinstance(payload, ServerInfo):
+        if kind in ("auto", "monitor", "discord"):
+            generation, payload = payload
+            if generation != getattr(self, f"_{'rpc' if kind == 'discord' else kind}_generation"):
+                return
+        if kind in ("scan_info", "scan_error"):
+            generation, address, payload = payload
+            if generation != self._scan_generation or address != self.current_server_address:
+                return
+            self.scan_button.configure(state="normal")
+        if kind == "auto" and isinstance(payload, AutoJoinEvent):
+            self._handle_auto_event(payload)
+        elif kind == "scan_info" and isinstance(payload, ServerInfo):
             self._debug("event scan_info", map=payload.map_name, players=payload.players, max_players=payload.max_players)
-            self._update_info(payload)
+            self._update_info(payload, address)
             self._start_server_monitor_if_possible("scan-info")
             self.status_var.set("READY")
-            self._log(format_server_scan_message(payload, int(self.threshold_var.get())))
+            try:
+                threshold = int(self.threshold_var.get())
+            except (ValueError, tk.TclError):
+                threshold = 63
+            self._log(format_server_scan_message(payload, threshold))
         elif kind == "scan_error":
             self._debug("event scan_error", error=str(payload))
             self.status_var.set("ERROR")
+            self._log(f"Scan failed: {payload}")
         elif kind == "gsi" and isinstance(payload, GsiSnapshot):
             self._debug(
                 "event gsi",
@@ -764,6 +612,12 @@ class ZeJoinerApp:
             self._handle_discord_event(payload)
         elif kind == "monitor" and isinstance(payload, ServerMonitorEvent):
             self._handle_monitor_event(payload)
+        elif kind == "cs2_mute" and isinstance(payload, ProcessMuteResult):
+            self._handle_cs2_mute_result(payload)
+        elif kind == "cs2_mute_error":
+            self._handle_cs2_mute_error(str(payload))
+        elif kind == "log_cleanup" and isinstance(payload, CleanupResult):
+            self._handle_cleanup_result(payload)
 
     def _handle_discord_event(self, event: DiscordRpcWorkerEvent) -> None:
         self._debug("event discord", kind=event.kind, event_message=event.message)
@@ -775,6 +629,10 @@ class ZeJoinerApp:
             self.discord_status_var.set("LIVE")
         elif event.kind == "warning":
             self.discord_status_var.set("RECONNECTING")
+            self._log(event.message)
+        elif event.kind == "rejected":
+            self.discord_status_var.set("REJECTED")
+            self._log(event.message)
         elif event.kind == "error":
             self.discord_enabled_var.set(False)
             self.discord_status_var.set("ERROR")
@@ -784,6 +642,28 @@ class ZeJoinerApp:
         elif event.kind == "closed":
             if not self.discord_enabled_var.get():
                 self.discord_status_var.set("OFF")
+
+    def _handle_cs2_mute_result(self, result: ProcessMuteResult) -> None:
+        self._debug(
+            "event cs2 mute",
+            found=result.found,
+            muted=result.muted,
+            session_count=result.session_count,
+        )
+        if not result.found:
+            self._set_cs2_mute_button_idle()
+            self._log("CS2 audio session was not found. Start CS2 or play audio once.")
+            return
+
+        self._set_cs2_mute_button_muted(result.muted)
+        state = "muted" if result.muted else "unmuted"
+        self._log(f"CS2 audio {state}: {result.session_count} session(s).")
+
+    def _handle_cs2_mute_error(self, message: str) -> None:
+        self._debug("event cs2 mute error", error=message)
+        self._set_cs2_mute_button_idle()
+        self._log(f"CS2 audio mute failed: {message}")
+
 
     def _handle_monitor_event(self, event: ServerMonitorEvent) -> None:
         self._debug(
@@ -797,7 +677,7 @@ class ZeJoinerApp:
             max_players=event.info.max_players if event.info is not None else None,
         )
         if event.kind == "info" and event.info is not None:
-            self._update_info(event.info)
+            self._update_info(event.info, event.address)
         elif event.kind == "started":
             return
         elif event.kind == "error":
@@ -817,10 +697,11 @@ class ZeJoinerApp:
             max_players=event.info.max_players if event.info is not None else None,
         )
         if event.info is not None:
-            self._update_info(event.info)
+            self._update_info(event.info, event.address)
 
         if event.kind == "started":
             self.status_var.set("AUTO")
+            self._log(event.message)
         elif event.kind == "info":
             if event.info is not None and event.info.players >= event.info.max_players:
                 self.status_var.set("FULL")
@@ -828,25 +709,52 @@ class ZeJoinerApp:
                 self.status_var.set("AUTO")
         elif event.kind == "error":
             self.status_var.set("AUTO")
+            self._log(f"Scan failed: {event.error}")
             return
+        elif event.kind == "launch_error":
+            self.status_var.set("ERROR")
+            self._log(f"Connect failed: {event.error}")
         elif event.kind == "joining":
             self.status_var.set("JOINING")
+        elif event.kind == "connect_requested":
+            self.status_var.set("CONNECTING")
+            self._log(event.message)
+        elif event.kind == "retrying":
+            self.status_var.set("RETRY WAIT")
+            self._log(event.message)
+        elif event.kind == "full":
+            self.status_var.set("REJECTED FULL")
+            self._log(event.message)
+        elif event.kind == "unconfirmed":
+            self.status_var.set("UNCONFIRMED")
+            self._log(f"{event.message} {event.error}".rstrip())
+        elif event.kind == "tracking_error":
+            self._log(f"Connection tracking unavailable: {event.error}")
+        elif event.kind in ("failed", "cancelled"):
+            self.status_var.set("ERROR" if event.kind == "failed" else "IDLE")
+            self._log(event.message)
         elif event.kind == "joined":
             self.status_var.set("JOINED")
             self._set_auto_buttons(is_running=False)
             self._start_server_monitor_if_possible("joined")
             self._play_join_sound()
         elif event.kind == "stopped":
-            if self.status_var.get() != "JOINED":
+            if self.status_var.get() not in ("JOINED", "ERROR", "UNCONFIRMED", "REJECTED FULL"):
                 self.status_var.set("IDLE")
+            self.worker = None
             self._set_auto_buttons(is_running=False)
+            self._start_server_monitor_if_possible("auto-stopped")
+            self._log(event.message)
 
         if event.kind in ("info", "joined"):
             self._log(event.message)
 
-    def _update_info(self, info: ServerInfo) -> None:
+    def _update_info(self, info: ServerInfo, address: ServerAddress | None = None) -> None:
+        if address is not None and address != self.current_server_address:
+            return
         self.latest_server_info = info
-        self.latest_server_info_address = self.current_server_address
+        self._server_received_at = time.monotonic()
+        self.latest_server_info_address = address or self.current_server_address
         self._debug(
             "update a2s info",
             name=info.name,
@@ -865,6 +773,7 @@ class ZeJoinerApp:
 
     def _update_gsi(self, snapshot: GsiSnapshot) -> None:
         self.latest_gsi_snapshot = snapshot
+        self._gsi_received_at = time.monotonic()
         self._debug(
             "update gsi snapshot",
             player=snapshot.player_name,
@@ -885,35 +794,30 @@ class ZeJoinerApp:
         self._sync_discord_current_activity("gsi")
 
     def _update_presence_preview(self) -> None:
-        server_info = self._current_server_info()
-        map_name = ""
-        if self.latest_gsi_snapshot is not None and self.latest_gsi_snapshot.map_name:
-            map_name = self.latest_gsi_snapshot.map_name
-        elif server_info is not None and server_info.map_name:
-            map_name = server_info.map_name
-
-        if not map_name:
+        activity = build_activity_from_presence_state(
+            snapshot=self._fresh_gsi_snapshot(), server_info=self._current_server_info())
+        if activity is None:
             self.presence_var.set("-")
             return
+        self.presence_var.set("\n".join(activity[key] for key in ("name", "details", "state") if activity.get(key)))
 
-        players = ""
-        if server_info is not None:
-            players = format_players(server_info)
-        if (
-            self.latest_gsi_snapshot is not None
-            and self.latest_gsi_snapshot.score_ct is not None
-            and self.latest_gsi_snapshot.score_t is not None
-        ):
-            state = f"Score:{format_score(self.latest_gsi_snapshot.score_ct, self.latest_gsi_snapshot.score_t)}"
-        else:
-            state = "Score unavailable"
+    def _fresh_gsi_snapshot(self) -> GsiSnapshot | None:
+        if time.monotonic() - self._gsi_received_at > GSI_MAX_AGE_SECONDS:
+            return None
+        return self.latest_gsi_snapshot
 
-        preview_parts = [format_map_line(map_name, players)]
-        details = format_details(server_info, players)
-        if details:
-            preview_parts.append(details)
-        preview_parts.append(state)
-        self.presence_var.set("\n".join(preview_parts))
+    def _refresh_presence(self) -> None:
+        if self._closed:
+            return
+        try:
+            if self.latest_gsi_snapshot is not None and self._fresh_gsi_snapshot() is None:
+                self.latest_gsi_snapshot = None
+                self.gsi_map_var.set("-")
+                self.gsi_score_var.set("-")
+            self._update_presence_preview()
+            self._sync_discord_current_activity("refresh")
+        finally:
+            self.root.after(1000, self._refresh_presence)
 
     def _sync_discord_current_activity(self, source: str) -> None:
         if self.discord_worker is None or not self.discord_enabled_var.get():
@@ -930,12 +834,15 @@ class ZeJoinerApp:
             self._start_server_monitor_if_possible(f"sync-{source}")
 
         activity = build_activity_from_presence_state(
-            snapshot=self.latest_gsi_snapshot,
+            snapshot=self._fresh_gsi_snapshot(),
             server_info=server_info,
             rpc_config=self._current_discord_config(),
             join_url=self._current_join_url(),
         )
         if activity is None:
+            if self.last_discord_activity_key:
+                self.discord_worker.clear_activity()
+                self.last_discord_activity_key = ""
             self.discord_status_var.set("WAITING MAP")
             self._debug("discord sync waiting map", source=source)
             return
@@ -944,6 +851,8 @@ class ZeJoinerApp:
         now = time.monotonic()
         if activity_key == self.last_discord_activity_key:
             status = self.discord_status_var.get()
+            if status == "REJECTED":
+                return
             resend_seconds = DISCORD_LIVE_RESEND_SECONDS if status == "LIVE" else DISCORD_PENDING_RESEND_SECONDS
             if now - self.last_discord_queue_time < resend_seconds:
                 self._debug(
@@ -984,6 +893,8 @@ class ZeJoinerApp:
         return f"steam://connect/{address}"
 
     def _current_server_info(self) -> ServerInfo | None:
+        if time.monotonic() - self._server_received_at > A2S_MAX_AGE_SECONDS:
+            return None
         if self.latest_server_info is None:
             return None
         if self.current_server_address is None:
@@ -1008,6 +919,9 @@ class ZeJoinerApp:
             self.current_server_address = address
             self.latest_server_info = None
             self.latest_server_info_address = None
+            self.latest_gsi_snapshot = None
+            self.gsi_map_var.set("-")
+            self.gsi_score_var.set("-")
             self._debug("current server address set", reason=reason, address=str(address))
         if self.address_var.get().strip() != str(address):
             self.address_var.set(str(address))
@@ -1018,6 +932,8 @@ class ZeJoinerApp:
                 self._debug("server address save failed", reason=reason, address=str(address), error=repr(exc))
 
     def _start_server_monitor_if_possible(self, reason: str) -> None:
+        if self._closed or (self.worker is not None and self.worker.is_running):
+            return
         if not self.discord_enabled_var.get():
             self._debug("server monitor skipped; rpc disabled", reason=reason)
             return
@@ -1046,7 +962,7 @@ class ZeJoinerApp:
         self.server_monitor = ServerMonitorWorker(
             client=self.client,
             settings=settings,
-            on_event=lambda event: self.events.put(("monitor", event)),
+            on_event=lambda event, generation=self._monitor_generation: self.events.put(("monitor", (generation, event))),
         )
         self.server_monitor.start()
         self._debug(
@@ -1057,13 +973,15 @@ class ZeJoinerApp:
         )
 
     def _stop_server_monitor(self) -> None:
+        self._monitor_generation += 1
         if self.server_monitor is not None and self.server_monitor.is_running:
             self.server_monitor.stop()
             self._debug("server monitor stop requested")
         self.server_monitor = None
 
     def _set_auto_buttons(self, is_running: bool) -> None:
-        self.join_button.configure(state="disabled" if is_running else "normal")
+        self.join_button.configure(state="disabled" if is_running or self._cleanup_busy else "normal")
+        self.scan_button.configure(state="disabled" if is_running else "normal")
         self.stop_button.configure(state="normal" if is_running else "disabled")
 
     def _initial_sound_choice(self) -> str:
@@ -1084,15 +1002,6 @@ class ZeJoinerApp:
             return None
         return sound.path
 
-    def _update_sound_toggle(self) -> None:
-        enabled = self.sound_enabled_var.get()
-        self.sound_toggle.configure(
-            text="SOUND ON" if enabled else "SOUND OFF",
-            bg=GREEN if enabled else PANEL_2,
-            fg=BG if enabled else TEXT,
-            activebackground=GREEN if enabled else PANEL_2,
-            activeforeground=BG if enabled else TEXT,
-        )
 
     def _toggle_sound(self) -> None:
         self._update_sound_toggle()
@@ -1110,15 +1019,6 @@ class ZeJoinerApp:
         except OSError as exc:
             self._debug("sound settings save failed", error=repr(exc))
 
-    def _update_discord_toggle(self) -> None:
-        enabled = self.discord_enabled_var.get()
-        self.discord_toggle.configure(
-            text="RPC ON" if enabled else "RPC OFF",
-            bg=GREEN if enabled else PANEL_2,
-            fg=BG if enabled else TEXT,
-            activebackground=GREEN if enabled else PANEL_2,
-            activeforeground=BG if enabled else TEXT,
-        )
 
     def _play_join_sound(self) -> None:
         try:
@@ -1136,7 +1036,7 @@ class ZeJoinerApp:
 
     def _show_error(self, message: str) -> None:
         self._debug("show error", error_message=message)
-        messagebox.showerror("ZE Joiner", message)
+        messagebox.showerror("CS2 Joiner", message)
 
     def _debug(self, message: str, **fields) -> None:
         self.debug_logger.log("gui", message, **fields)
@@ -1144,10 +1044,15 @@ class ZeJoinerApp:
     def _log(self, message: str) -> None:
         self.log.configure(state="normal")
         self.log.insert("end", f"{message}\n")
+        line_count = int(self.log.index("end-1c").split(".")[0])
+        if line_count > 2000:
+            self.log.delete("1.0", f"{line_count - 2000 + 1}.0")
         self.log.see("end")
         self.log.configure(state="disabled")
 
     def _close(self) -> None:
+        self._closed = True
+        self._cleanup_cancel.set()
         self._debug("close requested")
         self._save_request_rate()
         self._save_sound_settings()

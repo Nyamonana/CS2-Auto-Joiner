@@ -12,7 +12,7 @@ from .a2s import A2SClient, ServerAddress, ServerInfo
 class ServerMonitorSettings:
     address: ServerAddress
     interval_seconds: float = 10.0
-    timeout_seconds: float = 0.15
+    timeout_seconds: float = 0.5
 
     def __post_init__(self) -> None:
         if self.interval_seconds <= 0:
@@ -27,6 +27,7 @@ class ServerMonitorEvent:
     message: str
     info: ServerInfo | None = None
     error: str = ""
+    address: ServerAddress | None = None
 
 
 def format_monitor_message(info: ServerInfo) -> str:
@@ -79,6 +80,8 @@ class ServerMonitorWorker:
                 except Exception as exc:
                     self._emit("error", "Server monitor A2S query failed.", error=str(exc))
                 else:
+                    if self._stop_event.is_set():
+                        break
                     self._emit("info", format_monitor_message(info), info=info)
 
                 sleep_seconds = compute_sleep_seconds(self._settings.interval_seconds, started_at)
@@ -89,7 +92,7 @@ class ServerMonitorWorker:
             self._emit("stopped", "Server monitor stopped.")
 
     def _emit(self, kind: str, message: str, info: ServerInfo | None = None, error: str = "") -> None:
-        self._on_event(ServerMonitorEvent(kind=kind, message=message, info=info, error=error))
+        self._on_event(ServerMonitorEvent(kind=kind, message=message, info=info, error=error, address=self.address))
 
 
 def compute_sleep_seconds(interval_seconds: float, started_at: float, now: float | None = None) -> float:

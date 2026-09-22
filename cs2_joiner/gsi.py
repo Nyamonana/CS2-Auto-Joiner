@@ -263,9 +263,12 @@ def _find_steam_path_from_registry() -> Path | None:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Valve\Steam") as key:
             value, _ = winreg.QueryValueEx(key, "SteamPath")
     except OSError:
-        return None
-    path = Path(str(value).replace("/", "\\"))
-    return path if path.is_dir() else None
+        value = ""
+    candidates = [Path(str(value).replace("/", "\\"))] if value else []
+    for key in ("ProgramFiles(x86)", "ProgramFiles"):
+        if os.environ.get(key):
+            candidates.append(Path(os.environ[key]) / "Steam")
+    return next((path for path in candidates if path.is_dir()), None)
 
 
 def _find_steam_library_roots(steam_root: Path) -> list[Path]:

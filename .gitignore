@@ -1,0 +1,19 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+.venv-build/
+.build/
+/dist/
+
+# Local user settings
+/ze_joiner.ini
+/logs/
+/console.log
+
+# Local backups and generated distribution artifacts
+/backup/
+/release/
+/.agents/
+/AI_NOTES.md

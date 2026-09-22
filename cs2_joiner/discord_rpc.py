@@ -1,6 +1,5 @@
 ﻿from __future__ import annotations
 
-from configparser import ConfigParser
 from dataclasses import dataclass
 import json
 import os
@@ -12,12 +11,16 @@ from typing import Callable, Iterable
 from uuid import uuid4
 
 from .a2s import ServerInfo
+from .config_io import read_config, write_config
 from .debug_log import DebugLogger, mask_client_id
 from .gsi import GsiSnapshot
 
 
 OP_HANDSHAKE = 0
 OP_FRAME = 1
+OP_CLOSE = 2
+OP_PING = 3
+OP_PONG = 4
 DISCORD_CONFIG_SECTION = "Discord"
 DISCORD_ACTIVITY_TEXT_LIMIT = 128
 
@@ -32,6 +35,74 @@ class DiscordRpcConfig:
 
 class DiscordRpcError(RuntimeError):
     pass
+
+
+class DiscordRpcRejected(DiscordRpcError):
+    pass
+
+
+class WindowsDiscordIpcPipe:
+    """Overlapped pipe IO permits concurrent reads/writes without CRT fd locks."""
+
+    def __init__(self, path: str, write_timeout_seconds: float = 2.0):
+        import _winapi
+        self._api = _winapi
+        self._handle = _winapi.CreateFile(path, 0xC0000000, 0, 0, 3, 0x40000000, 0)
+        self._lock = threading.Lock()
+        self._operations = []
+        self._closed = False
+        self._write_timeout_ms = max(1, int(write_timeout_seconds * 1000))
+
+    def read(self, size: int) -> bytes:
+        operation, count = self._perform(self._api.ReadFile, size, None)
+        return operation.getbuffer()[:count]
+
+    def write(self, data: bytes) -> None:
+        offset = 0
+        while offset < len(data):
+            _, count = self._perform(self._api.WriteFile, data[offset:], self._write_timeout_ms)
+            if not count:
+                raise OSError("Discord IPC write returned zero bytes.")
+            offset += count
+
+    def _perform(self, function, value, timeout_ms):
+        with self._lock:
+            if self._closed:
+                raise OSError("Discord IPC pipe is closed.")
+            operation, error = function(self._handle, value, overlapped=True)
+            self._operations.append(operation)
+        try:
+            if error == self._api.ERROR_IO_PENDING:
+                result = self._api.WaitForMultipleObjects(
+                    [operation.event], False, self._api.INFINITE if timeout_ms is None else timeout_ms)
+                if result == self._api.WAIT_TIMEOUT:
+                    operation.cancel()
+                    operation.GetOverlappedResult(True)
+                    raise TimeoutError("Discord IPC write timed out.")
+            count, error = operation.GetOverlappedResult(True)
+            if error:
+                raise OSError(error, "Discord IPC operation failed.")
+            return operation, count
+        finally:
+            operation.cancel()
+            with self._lock:
+                self._operations.remove(operation)
+
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            for operation in self._operations:
+                operation.cancel()
+            self._api.CloseHandle(self._handle)
+
+
+@dataclass
+class _PendingResponse:
+    event: threading.Event
+    response: dict | None = None
+    error: str = ""
 
 
 class DiscordIpcPipe:
@@ -100,6 +171,12 @@ def build_activity_from_presence_state(
     rpc_config: DiscordRpcConfig | None = None,
     join_url: str = "",
 ) -> dict | None:
+    if snapshot is not None and not snapshot.map_name:
+        snapshot = None
+    if snapshot is not None and server_info is not None and snapshot.map_name != server_info.map_name:
+        server_info = None
+    if server_info is None:
+        join_url = ""
     map_name = ""
     if snapshot is not None and snapshot.map_name:
         map_name = snapshot.map_name
@@ -176,22 +253,22 @@ def _fit_activity_text(value: str) -> str:
 
 
 def load_discord_config(path: Path) -> DiscordRpcConfig:
-    parser = _new_config_parser()
-    if path.exists():
-        parser.read(path, encoding="utf-8")
+    parser = read_config(path)
+    try:
+        enabled = parser.getboolean(DISCORD_CONFIG_SECTION, "Enabled", fallback=False)
+    except ValueError:
+        enabled = False
 
     return DiscordRpcConfig(
         client_id=parser.get(DISCORD_CONFIG_SECTION, "ClientId", fallback="").strip(),
-        enabled=parser.getboolean(DISCORD_CONFIG_SECTION, "Enabled", fallback=False),
+        enabled=enabled,
         large_image=parser.get(DISCORD_CONFIG_SECTION, "LargeImage", fallback="").strip(),
         small_image=parser.get(DISCORD_CONFIG_SECTION, "SmallImage", fallback="").strip(),
     )
 
 
 def save_discord_config(path: Path, config: DiscordRpcConfig) -> None:
-    parser = _new_config_parser()
-    if path.exists():
-        parser.read(path, encoding="utf-8")
+    parser = read_config(path)
     if not parser.has_section(DISCORD_CONFIG_SECTION):
         parser.add_section(DISCORD_CONFIG_SECTION)
 
@@ -200,8 +277,7 @@ def save_discord_config(path: Path, config: DiscordRpcConfig) -> None:
     parser.set(DISCORD_CONFIG_SECTION, "LargeImage", config.large_image.strip())
     parser.set(DISCORD_CONFIG_SECTION, "SmallImage", config.small_image.strip())
 
-    with open(path, "w", encoding="utf-8") as file:
-        parser.write(file)
+    write_config(path, parser)
 
 
 class DiscordRpcClient:
@@ -212,12 +288,16 @@ class DiscordRpcClient:
         pipe_paths: Iterable[str] | None = None,
         debug_logger: DebugLogger | None = None,
         write_timeout_seconds: float = 2.0,
+        response_timeout_seconds: float = 3.0,
     ):
         self.client_id = client_id.strip()
         self.pid = pid if pid is not None else os.getpid()
         self.pipe_paths = list(pipe_paths) if pipe_paths is not None else _default_pipe_paths()
         self._debug_logger = debug_logger
         self._write_timeout_seconds = write_timeout_seconds
+        self._response_timeout_seconds = response_timeout_seconds
+        self._pending: dict[str, _PendingResponse] = {}
+        self._state_lock = threading.RLock()
         self._file: object | None = None
         self._write_lock = threading.Lock()
         self._reader_thread: threading.Thread | None = None
@@ -248,7 +328,7 @@ class DiscordRpcClient:
         for index, pipe_path in enumerate(self.pipe_paths):
             self._debug("opening pipe", index=index, pipe_path=pipe_path)
             try:
-                pipe = _open_ipc_pipe(pipe_path)
+                pipe = _open_ipc_pipe(pipe_path, self._write_timeout_seconds)
             except OSError as exc:
                 last_error = exc
                 self._debug(
@@ -264,7 +344,7 @@ class DiscordRpcClient:
                 frame = encode_frame(OP_HANDSHAKE, {"v": 1, "client_id": self.client_id})
                 self._debug("pipe opened", index=index, pipe_path=pipe_path)
                 self._debug("handshake write start", bytes=len(frame))
-                pipe.write(frame)
+                self._write_bytes_with_timeout(pipe, frame)
                 self._debug("handshake write ok")
                 self._file = pipe
                 self._start_reader_thread()
@@ -318,8 +398,14 @@ class DiscordRpcClient:
         )
         if auto_connect and not self.is_connected:
             self.connect()
+        if auto_connect:
+            if not self.wait_until_ready(self._response_timeout_seconds):
+                self.close()
+                raise DiscordRpcError("Discord READY response timed out.")
         if not self.is_connected:
             self._debug("send activity skipped; not connected")
+            if auto_connect:
+                raise DiscordRpcError("Discord IPC connection closed before sending activity.")
             return
 
         command = {
@@ -330,7 +416,22 @@ class DiscordRpcClient:
             },
             "nonce": str(uuid4()),
         }
-        self._write_frame(OP_FRAME, command)
+        pending = _PendingResponse(threading.Event())
+        nonce = command["nonce"]
+        with self._state_lock:
+            self._pending[nonce] = pending
+        try:
+            self._write_frame(OP_FRAME, command)
+            if not pending.event.wait(self._response_timeout_seconds):
+                self._close_file()
+                raise DiscordRpcError("Discord SET_ACTIVITY response timed out.")
+            if pending.error:
+                raise DiscordRpcError(pending.error)
+            if pending.response is not None and pending.response.get("evt") == "ERROR":
+                raise DiscordRpcRejected(f"Discord rejected activity: {pending.response.get('data')}")
+        finally:
+            with self._state_lock:
+                self._pending.pop(nonce, None)
 
     def _write_frame(self, opcode: int, payload: dict) -> None:
         frame = encode_frame(opcode, payload)
@@ -343,6 +444,9 @@ class DiscordRpcClient:
                 self._debug("write frame start", opcode=opcode, command=command, bytes=len(frame))
                 self._write_bytes_with_timeout(self._file, frame)
                 self._debug("write frame ok", opcode=opcode, command=command, bytes=len(frame))
+            except TimeoutError as exc:
+                self._close_file()
+                raise DiscordRpcError(f"Discord IPC write timed out after {self._write_timeout_seconds:.1f}s") from exc
             except OSError as exc:
                 self._close_file()
                 self._debug(
@@ -353,17 +457,11 @@ class DiscordRpcClient:
                     winerror=getattr(exc, "winerror", None),
                 )
                 raise DiscordRpcError(f"Discord IPC write failed: {exc}") from exc
-            except TimeoutError as exc:
-                self._close_file()
-                self._debug(
-                    "write frame timeout",
-                    opcode=opcode,
-                    command=command,
-                    timeout=self._write_timeout_seconds,
-                )
-                raise DiscordRpcError(f"Discord IPC write timed out after {self._write_timeout_seconds:.1f}s") from exc
 
     def _write_bytes_with_timeout(self, pipe: object, data: bytes) -> None:
+        if isinstance(pipe, WindowsDiscordIpcPipe):
+            pipe.write(data)
+            return
         result: list[Exception | None] = [None]
 
         def write_pipe() -> None:
@@ -381,15 +479,15 @@ class DiscordRpcClient:
             raise result[0]
 
     def _start_reader_thread(self) -> None:
-        self._reader_thread = threading.Thread(target=self._reader_loop, name="discord-rpc-reader", daemon=True)
+        self._reader_thread = threading.Thread(target=self._reader_loop, args=(self._file,), name="discord-rpc-reader", daemon=True)
         self._reader_thread.start()
         self._debug("reader thread started")
 
-    def _reader_loop(self) -> None:
+    def _reader_loop(self, pipe=None) -> None:
         self._debug("reader loop started")
+        pipe = self._file if pipe is None else pipe
         while True:
-            pipe = self._file
-            if pipe is None:
+            if pipe is None or pipe is not self._file:
                 self._debug("reader loop stopped; no pipe")
                 return
             try:
@@ -397,37 +495,55 @@ class DiscordRpcClient:
                 header = self._read_exact(pipe, 8)
                 if not header:
                     self._debug("reader got empty header; closing")
-                    self._close_file()
+                    self._close_file(pipe)
                     return
                 if len(header) != 8:
                     self._debug("reader got partial header; closing", bytes=len(header))
-                    self._close_file()
+                    self._close_file(pipe)
                     return
                 _, length = struct.unpack("<II", header)
+                if length > 1024 * 1024:
+                    raise ValueError("Discord IPC frame exceeds the size limit.")
                 payload = b""
                 if length:
                     payload = self._read_exact(pipe, length)
                     if len(payload) != length:
                         self._debug("reader got partial payload; closing", expected=length, bytes=len(payload))
-                        self._close_file()
+                        self._close_file(pipe)
                         return
                 try:
                     opcode, decoded = decode_frame(header, payload)
                 except Exception as exc:
                     self._debug("reader frame decode failed", length=length, error=repr(exc), payload=payload.decode("utf-8", errors="replace"))
                 else:
-                    self._debug("reader frame received", opcode=opcode, length=length, payload=decoded)
-                    if self._handle_reader_frame(decoded):
-                        self._debug("reader loop stopped after handshake", event=decoded.get("evt"))
+                    if pipe is not self._file:
                         return
-            except (OSError, ValueError, struct.error):
+                    self._debug("reader frame received", opcode=opcode, length=length, payload=decoded)
+                    if opcode == OP_CLOSE:
+                        self._close_file(pipe)
+                        return
+                    if opcode == OP_PING:
+                        self._write_frame(OP_PONG, decoded)
+                    elif opcode == OP_FRAME:
+                        self._handle_reader_frame(decoded)
+            except (OSError, ValueError, struct.error, DiscordRpcError, AttributeError):
                 self._debug("reader loop failed", error="read/decode exception")
-                self._close_file()
+                self._close_file(pipe)
                 return
 
-    def _close_file(self) -> None:
-        pipe = self._file
-        self._file = None
+    def _close_file(self, expected_pipe=None) -> None:
+        with self._state_lock:
+            if expected_pipe is not None and self._file is not expected_pipe:
+                return
+            pipe = self._file
+            self._file = None
+            if not self._ready_event.is_set():
+                self._ready_error = "Discord IPC closed before READY."
+                self._ready_event.set()
+            for pending in self._pending.values():
+                if not pending.event.is_set():
+                    pending.error = "Discord IPC connection closed."
+                    pending.event.set()
         if pipe is not None:
             try:
                 pipe.close()  # type: ignore[attr-defined]
@@ -450,16 +566,25 @@ class DiscordRpcClient:
             self._debug_logger.log("discord.client", message, **fields)
 
     def _handle_reader_frame(self, payload: dict) -> bool:
+        if not isinstance(payload, dict):
+            raise ValueError("Discord IPC payload must be an object.")
+        nonce = payload.get("nonce")
+        with self._state_lock:
+            pending = self._pending.get(nonce) if isinstance(nonce, str) else None
+            if pending is not None and payload.get("cmd") == "SET_ACTIVITY":
+                pending.response = payload
+                pending.event.set()
+                return False
         event_name = payload.get("evt")
         if event_name == "READY":
             self._debug("ready received")
             self._ready_event.set()
-            return True
+            return False
         elif event_name == "ERROR":
-            self._ready_error = str(payload.get("data") or payload)
-            self._debug("error frame received", error=self._ready_error)
-            self._ready_event.set()
-            return True
+            if not self._ready_event.is_set():
+                self._ready_error = str(payload.get("data") or payload)
+                self._ready_event.set()
+            self._debug("error frame received", error=str(payload.get("data")))
         return False
 
 
@@ -505,6 +630,9 @@ class DiscordRpcWorker:
         self._stop_requested.set()
         self._put_command("stop", None)
 
+    def clear_activity(self) -> None:
+        self._put_command("clear", None)
+
     def wait(self, timeout: float | None = None) -> bool:
         thread = self._thread
         if thread is None:
@@ -526,11 +654,13 @@ class DiscordRpcWorker:
 
                 self._debug("command received", command=command, activity=_summarize_activity(payload))
                 if command == "stop":
-                    self._clear_client()
                     return
                 if command == "update" and payload is not None:
                     self._update_client(payload)
+                elif command == "clear":
+                    self._clear_client()
         finally:
+            self._clear_client()
             self._close_client()
             self._emit("closed", "Discord RPC stopped.")
             self._debug("worker thread stopped")
@@ -545,16 +675,15 @@ class DiscordRpcWorker:
         try:
             self._debug("client update begin", activity=_summarize_activity(activity))
             self._client.update_activity(activity)
+        except DiscordRpcRejected as exc:
+            self._emit("rejected", str(exc))
         except Exception as exc:
             self._debug("client update failed", error=repr(exc), activity=_summarize_activity(activity))
             self._emit("warning", f"Discord RPC update failed; reconnecting: {exc}")
             self._close_client()
             if self._wait_before_reconnect():
                 return
-            if self._connect_client():
-                self._update_client(activity)
-            else:
-                self._requeue_activity(activity)
+            self._requeue_activity(activity)
         else:
             self._debug("client update ok", activity=_summarize_activity(activity))
             self._emit("updated", "Discord RPC updated.")
@@ -568,15 +697,14 @@ class DiscordRpcWorker:
             if hasattr(client, "wait_until_ready"):
                 self._debug("client ready wait begin", timeout=self._ready_timeout_seconds)
                 if not client.wait_until_ready(self._ready_timeout_seconds):
-                    self._debug("client ready wait timeout; continuing")
-                    self._emit("warning", "Discord RPC READY timeout; sending activity anyway.")
+                    raise DiscordRpcError("Discord RPC READY timeout.")
         except Exception as exc:
             self._debug("client connect failed", error=repr(exc))
             self._close_client()
             self._emit("warning", f"Discord RPC reconnect failed: {exc}")
             return False
 
-        self._debug("client ready or soft-timeout")
+        self._debug("client ready")
         self._emit("connected", "Discord RPC connected.")
         return True
 
@@ -590,7 +718,10 @@ class DiscordRpcWorker:
         if self._stop_requested.is_set():
             return
         self._debug("activity requeued after reconnect failure", activity=_summarize_activity(activity))
-        self._put_command("update", activity)
+        try:
+            self._commands.put_nowait(("update", activity))
+        except queue.Full:
+            pass  # A newer activity (or STOP) always takes precedence.
 
     def _clear_client(self) -> None:
         if self._client is None:
@@ -601,7 +732,8 @@ class DiscordRpcWorker:
             self._client.clear_activity()
         except Exception as exc:
             self._debug("client clear failed", error=repr(exc))
-            self._emit("error", f"Discord RPC clear failed: {exc}")
+            self._close_client()
+            self._emit("warning", f"Discord RPC clear failed: {exc}")
         else:
             self._debug("client clear ok")
 
@@ -655,19 +787,15 @@ def _default_pipe_paths() -> list[str]:
     return standard_paths + extended_paths
 
 
-def _open_ipc_pipe(pipe_path: str) -> DiscordIpcPipe:
+def _open_ipc_pipe(pipe_path: str, write_timeout_seconds: float = 2.0):
+    if os.name == "nt":
+        return WindowsDiscordIpcPipe(pipe_path, write_timeout_seconds)
     flags = os.O_RDWR
     if hasattr(os, "O_BINARY"):
         flags |= os.O_BINARY
     if hasattr(os, "O_NOINHERIT"):
         flags |= os.O_NOINHERIT
     return DiscordIpcPipe(os.open(pipe_path, flags))
-
-
-def _new_config_parser() -> ConfigParser:
-    parser = ConfigParser()
-    parser.optionxform = str
-    return parser
 
 
 def _apply_activity_options(

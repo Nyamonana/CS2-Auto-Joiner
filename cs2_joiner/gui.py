@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 from pathlib import Path
 import queue
@@ -25,6 +26,13 @@ from .discord_rpc import (
 from .gsi import GsiServer, GsiSnapshot, build_gsi_config, find_cs2_cfg_dirs, install_gsi_config
 from .paths import application_directory
 from .log_cleanup import CleanupResult, LogCleanupManager
+from .log_output import (
+    CFG_NAMES, KEY_CFG_NAME, LOG_KEYS, LogOutputMonitor, install_key_bindings, install_log_profiles,
+    load_log_output_settings, save_log_output_settings,
+)
+from .log_overlay import GameWindows, LogStatusOverlay, OverlaySettings, POSITIONS, load_overlay_settings, save_overlay_settings
+from .log_resume import ResumeKeySender, ResumeRequest
+from .retry_guide import RetryGuide
 from .server_monitor import ServerMonitorEvent, ServerMonitorSettings, ServerMonitorWorker
 from .server_target import (
     SoundSettings,
@@ -105,6 +113,26 @@ class ZeJoinerApp(JoinerLayout):
         self._cleanup_cancel = threading.Event()
         self._cleanup_generation = 0
         self._cleanup_last_message = ""
+        self._log_output_monitor: LogOutputMonitor | None = None
+        self._log_output_generation = 0
+        self._log_output_dialog: tk.Toplevel | None = None
+        self._retry_guide: RetryGuide | None = None
+        self._log_output_error = ""
+        try:
+            self._log_output_settings = load_log_output_settings(self.config_path)
+        except ValueError as exc:
+            self._log_output_settings = None
+            self._log_output_error = str(exc)
+        self._log_output_required = self._log_output_settings is not None or bool(self._log_output_error)
+        self._pending_join: AutoJoinSettings | None = None
+        self._resume_request: ResumeRequest | None = None
+        self._resume_stage = ""
+        self._game_windows: GameWindows | None = None
+        self._game_windows_error = False
+        self._resume_sender: ResumeKeySender | None = None
+        self._log_overlay: LogStatusOverlay | None = None
+        self._last_game_pid: int | None = None
+        overlay_settings = load_overlay_settings(self.config_path)
 
         self.address_var = tk.StringVar(value=self.saved_server_address)
         self.request_rate_var = tk.IntVar(value=self.saved_request_rate)
@@ -129,15 +157,23 @@ class ZeJoinerApp(JoinerLayout):
         self.gsi_score_var = tk.StringVar(value="-")
         self.presence_var = tk.StringVar(value="-")
         self.discord_status_var = tk.StringVar(value="OFF")
+        self.log_output_status_var = tk.StringVar(value="NOT CONFIGURED")
+        self.log_resume_note_var = tk.StringVar(value="")
+        self.overlay_enabled_var = tk.BooleanVar(value=overlay_settings.enabled)
+        self.overlay_position_var = tk.StringVar(value=overlay_settings.position)
 
         self._build_style()
         self._build_layout()
         self._set_auto_buttons(is_running=False)
+        self._start_log_output_monitor()
         self._poll_events()
         self.root.protocol("WM_DELETE_WINDOW", self._close)
         self.root.after(100, self._restore_discord_rpc)
         self.root.after(1000, self._refresh_presence)
         self.root.after(10000, self._check_log_cleanup)
+        self.root.after(200, self._update_game_overlay)
+        if self.auto_retry_var.get():
+            self.root.after(300, self._show_retry_guide_if_enabled)
 
     def _configure_window(self) -> None:
         screen_width = self.root.winfo_screenwidth()
@@ -165,7 +201,7 @@ class ZeJoinerApp(JoinerLayout):
             self._show_error(str(exc))
             return
 
-        if self.worker is not None and self.worker.is_running:
+        if self._join_is_active():
             return
         self._set_current_server_address(address, "scan")
         self._debug("scan parsed address", address=str(address))
@@ -197,10 +233,10 @@ class ZeJoinerApp(JoinerLayout):
         self.start_auto_join()
 
     def start_auto_join(self) -> None:
-        if self._cleanup_busy:
+        if self._cleanup_busy and self.auto_retry_var.get():
             self._log("Log cleanup is finishing. Please press JOIN again shortly.")
             return
-        if self.worker is not None and self.worker.is_running:
+        if self._join_is_active():
             return
         try:
             address = parse_server_address(self.address_var.get())
@@ -216,6 +252,31 @@ class ZeJoinerApp(JoinerLayout):
             self._show_error(str(exc))
             return
 
+        if settings.auto_retry_enabled and self.console_log_path is None:
+            self._log("Auto retry needs CS2 console.log. Follow the setup guide, then press JOIN again.")
+            self.open_auto_retry_guide()
+            return
+        if settings.auto_retry_enabled and self._log_output_required and not self._log_output_ready():
+            if self._log_output_monitor is None or self._log_output_settings is None:
+                self.open_log_output_settings()
+                return
+            self._pending_join = settings
+            self._resume_request = ResumeRequest(self._log_output_monitor, self._log_output_settings.resume_key)
+            self._resume_stage = ""
+            self._scan_generation += 1
+            self._auto_generation += 1
+            self.worker = None
+            self._cleanup_generation += 1
+            self._stop_server_monitor()
+            self.status_var.set("LOG WAIT")
+            self.log_resume_note_var.set("Resume queued")
+            self._set_auto_buttons(is_running=True)
+            self._log(f"JOIN queued for {address}. Waiting for confirmed recording; STOP cancels the request.")
+            return
+        self._begin_auto_join(settings)
+
+    def _begin_auto_join(self, settings: AutoJoinSettings) -> None:
+        address = settings.address
         self._save_request_rate()
         self._cleanup_generation += 1
         self._set_current_server_address(address, "join")
@@ -226,29 +287,67 @@ class ZeJoinerApp(JoinerLayout):
         self.worker = AutoJoinWorker(
             self.client, self.launcher.join_server, settings,
             lambda event: self.events.put(("auto", (generation, event))),
-            connection_observer=ConsoleLogObserver(self.console_log_path) if self.console_log_path else None,
+            connection_observer=ConsoleLogObserver(self.console_log_path) if settings.auto_retry_enabled and self.console_log_path else None,
+            connection_ready=self._log_output_ready if settings.auto_retry_enabled and self._log_output_required else None,
         )
         self.worker.start()
         self._debug("auto join worker started", address=str(address), request_rate=settings.requests_per_second)
         self._set_auto_buttons(is_running=True)
 
     def stop_auto_join(self) -> None:
+        if self._pending_join is not None:
+            self._pending_join = None
+            self._resume_request = None
+            self._resume_stage = ""
+            self.log_resume_note_var.set("")
+            self.status_var.set("IDLE")
+            self._set_auto_buttons(is_running=False)
+            self._log("Queued JOIN cancelled.")
+            self._start_server_monitor_if_possible("queued-join-cancelled")
         if self.worker is not None and self.worker.is_running:
             self.worker.stop()
             self._debug("auto join stop requested")
 
+    def _join_is_active(self) -> bool:
+        return getattr(self, "_pending_join", None) is not None or (self.worker is not None and self.worker.is_running)
+
     def toggle_auto_retry(self) -> None:
         enabled = self.auto_retry_var.get()
         if self.worker is not None:
-            self.worker.set_auto_retry_enabled(enabled)
+            if enabled and self.worker.is_running:
+                self.worker.stop()
+                self._log("Auto retry enabled. Current JOIN stopped; finish setup and press JOIN again.")
+            else:
+                self.worker.set_auto_retry_enabled(enabled)
+        self._cleanup_generation += 1
+        if not enabled:
+            self._cleanup_cancel.set()
         try:
             save_auto_retry_enabled(self.config_path, enabled)
         except OSError as exc:
             self._log(f"Could not save auto retry setting: {exc}")
         self._log(f"Auto retry: {'ON' if enabled else 'OFF'}")
+        self._start_log_output_monitor()
+        if enabled:
+            self.open_auto_retry_guide()
+        else:
+            if self._log_overlay is not None:
+                self._log_overlay.hide()
+            self._advance_pending_join(None)
+        self._set_auto_buttons(is_running=self._join_is_active())
+
+    def _show_retry_guide_if_enabled(self) -> None:
+        if not self._closed and self.auto_retry_var.get():
+            self.open_auto_retry_guide()
+
+    def open_auto_retry_guide(self) -> None:
+        if self._retry_guide is not None and self._retry_guide.winfo_exists():
+            self._retry_guide.lift()
+            return
+        self._retry_guide = RetryGuide(self.root, self.open_log_output_settings, self.choose_console_log, self._button)
 
     def choose_console_log(self) -> None:
-        if self._cleanup_busy:
+        if self._cleanup_busy or self._join_is_active():
             return
         path = filedialog.askopenfilename(
             title="Select CS2 console.log", filetypes=[("CS2 console log", "*.log"), ("All files", "*.*")],
@@ -262,6 +361,248 @@ class ZeJoinerApp(JoinerLayout):
             except OSError as exc:
                 self._log(f"Could not save log selection: {exc}")
             self._log(f"CS2 connection log: {self.console_log_path}")
+            self._start_log_output_monitor()
+
+    def _start_log_output_monitor(self) -> None:
+        self._log_output_generation += 1
+        if self._log_output_monitor is not None:
+            self._log_output_monitor.stop()
+            self._log_output_monitor = None
+        if not self.auto_retry_var.get():
+            self.log_output_status_var.set("BYPASSED")
+            self.log_resume_note_var.set("")
+            return
+        settings = self._log_output_settings
+        if settings is None:
+            self.log_output_status_var.set("NOT CONFIGURED")
+            if self._log_output_error:
+                self.log_output_status_var.set("SETUP ERROR")
+                self._log(self._log_output_error)
+            return
+        self.log_output_status_var.set("UNKNOWN")
+        if self.console_log_path is None:
+            self._log("Manual log output: select console.log using CS2 log, then run the resume command.")
+            return
+        generation = self._log_output_generation
+        self._log_output_monitor = LogOutputMonitor(
+            settings, self.console_log_path,
+            lambda state, message: self.events.put(("log_output", (generation, state, message))),
+        )
+        self._log_output_monitor.start()
+
+    def _log_output_ready(self) -> bool:
+        monitor = self._log_output_monitor
+        return monitor is not None and monitor.recording_ready()
+
+    def open_log_output_settings(self) -> None:
+        if self._log_output_dialog is not None and self._log_output_dialog.winfo_exists():
+            self._log_output_dialog.lift()
+            return
+        dialog = self._log_output_dialog = tk.Toplevel(self.root)
+        dialog.title("Log output")
+        dialog.configure(bg=PANEL)
+        dialog.transient(self.root)
+        dialog.resizable(True, False)
+        tabs = ttk.Notebook(dialog, style="Log.TNotebook")
+        tabs.pack(fill="both", expand=True)
+        body = tk.Frame(tabs, bg=PANEL, padx=18, pady=16)
+        tabs.add(body, text="Profiles")
+        body.grid_columnconfigure(0, weight=1, minsize=400)
+        settings = self._log_output_settings
+        cfg_dirs = find_cs2_cfg_dirs()
+        directory = tk.StringVar(value=str(settings.cfg_dir) if settings else str(cfg_dirs[0]) if cfg_dirs else "")
+        snapshot = tk.StringVar()
+        self._label(body, "CS2 CFG DIRECTORY", size=9, color=MUTED).grid(row=0, column=0, sticky="w")
+        ttk.Entry(body, textvariable=directory, width=48).grid(row=1, column=0, sticky="ew", pady=(5, 12))
+
+        def choose_directory():
+            selected = filedialog.askdirectory(parent=dialog, title="Select CS2 game/csgo/cfg", initialdir=directory.get() or None)
+            if selected:
+                directory.set(selected)
+
+        self._button(body, "", choose_directory, PANEL_2, TEXT, icon="folder-open", tooltip="Select CS2 cfg directory").grid(row=1, column=1, padx=(8, 0), pady=(5, 12))
+        self._label(body, "CHANNEL SNAPSHOT (.txt)", size=9, color=MUTED).grid(row=2, column=0, sticky="w")
+        ttk.Entry(body, textvariable=snapshot).grid(row=3, column=0, sticky="ew", pady=(5, 12))
+
+        def choose_snapshot():
+            selected = filedialog.askopenfilename(parent=dialog, title="Select current log_dumpchannels output",
+                                                  filetypes=[("Channel snapshot", "*.txt")])
+            if selected:
+                snapshot.set(selected)
+
+        self._button(body, "", choose_snapshot, PANEL_2, TEXT, icon="folder-open", tooltip="Select a fresh log_dumpchannels snapshot taken before suppression").grid(row=3, column=1, padx=(8, 0), pady=(5, 12))
+
+        def install():
+            if self._join_is_active():
+                self._show_error("Stop JOIN before changing log output setup.")
+                return
+            if self._log_output_settings is not None and not self._log_output_ready():
+                self._show_error("Run the existing resume command before replacing the original channel snapshot.")
+                return
+            try:
+                if not directory.get().strip() or not snapshot.get().strip():
+                    raise ValueError("Select the CS2 cfg directory and a fresh log_dumpchannels text file.")
+                with Path(snapshot.get()).open(encoding="utf-8-sig") as handle:
+                    content = handle.read(256 * 1024 + 1)
+                if len(content) > 256 * 1024:
+                    raise ValueError("Select only one channel dump (maximum 256 KiB).")
+                new_settings = install_log_profiles(Path(directory.get()), content)
+                if self._log_output_settings is not None:
+                    new_settings = replace(new_settings, pause_key=self._log_output_settings.pause_key,
+                                           resume_key=self._log_output_settings.resume_key)
+                    if new_settings.resume_key:
+                        install_key_bindings(new_settings)
+                save_log_output_settings(self.config_path, new_settings)
+            except (OSError, ValueError) as exc:
+                self._show_error(str(exc))
+                return
+            self._log_output_settings = new_settings
+            self._log_output_required = True
+            self._log_output_error = ""
+            self._start_log_output_monitor()
+            self._log("Manual profiles saved. Copy and run the resume command in CS2 before JOIN. No keys or commands were sent.")
+
+        self._button(body, "Save log profiles", install, PANEL_2, TEXT, icon="file-down").grid(row=4, column=0, columnspan=2, sticky="ew", pady=(0, 14))
+        self._label(body, variable=self.log_output_status_var, color=GREEN, mono=True).grid(row=5, column=0, sticky="w", pady=(0, 10))
+        for row, state in enumerate(("paused", "recording"), 6):
+            command = "exec " + CFG_NAMES[state][:-4]
+            entry = ttk.Entry(body, width=40)
+            entry.insert(0, command)
+            entry.configure(state="readonly")
+            entry.grid(row=row, column=0, sticky="ew", pady=4)
+            self._button(body, "Copy", lambda value=state: self._copy_log_output_command(value), PANEL_2, TEXT,
+                         tooltip="Copy pause command" if state == "paused" else "Copy resume command").grid(row=row, column=1, padx=(8, 0), pady=4)
+
+        preferences = tk.Frame(tabs, bg=PANEL, padx=18, pady=16)
+        preferences.grid_columnconfigure(1, weight=1)
+        tabs.add(preferences, text="Keys & overlay")
+        pause_key = tk.StringVar(value=settings.pause_key if settings else "")
+        resume_key = tk.StringVar(value=settings.resume_key if settings else "")
+        for row, (title, variable) in enumerate((("SUPPRESS KEY", pause_key), ("RESUME KEY", resume_key))):
+            self._label(preferences, title, size=9, color=MUTED).grid(row=row, column=0, sticky="w", padx=(0, 16), pady=6)
+            ttk.Combobox(preferences, values=("",) + LOG_KEYS, textvariable=variable,
+                         state="readonly", width=15).grid(row=row, column=1, sticky="ew", pady=6)
+
+        def save_keys():
+            if self._join_is_active():
+                self._show_error("Stop JOIN before changing log keys.")
+                return
+            if self._log_output_settings is None:
+                self._show_error("Save log profiles first.")
+                return
+            try:
+                if not pause_key.get() or not resume_key.get():
+                    raise ValueError("Select two unused function keys.")
+                updated = replace(self._log_output_settings, pause_key=pause_key.get(), resume_key=resume_key.get())
+                install_key_bindings(updated)
+                save_log_output_settings(self.config_path, updated)
+            except (OSError, ValueError) as exc:
+                self._show_error(str(exc))
+                return
+            self._log_output_settings = updated
+            self._log("Key CFG saved. Run exec cs2_joiner_log_keys in CS2 to apply and confirm the selected bindings for this session.")
+
+        self._button(preferences, "Save keys", save_keys, PANEL_2, TEXT, icon="file-down").grid(row=2, column=0, columnspan=2, sticky="ew", pady=(8, 10))
+        self._button(preferences, "Copy key setup", self._copy_log_key_setup, PANEL_2, TEXT,
+                     tooltip="Apply the chosen key bindings and resume recording in CS2").grid(row=3, column=0, columnspan=2, sticky="ew")
+        self._rule(preferences).grid(row=4, column=0, columnspan=2, sticky="ew", pady=18)
+        self._toggle(preferences, "Game overlay", self.overlay_enabled_var, self._save_overlay_settings).grid(row=5, column=0, columnspan=2, sticky="w")
+        self._label(preferences, "POSITION", size=9, color=MUTED).grid(row=6, column=0, sticky="w", pady=8)
+        position = ttk.Combobox(preferences, values=POSITIONS, textvariable=self.overlay_position_var, state="readonly")
+        position.grid(row=6, column=1, sticky="ew", pady=8)
+        position.bind("<<ComboboxSelected>>", lambda event: self._save_overlay_settings())
+
+    def _copy_log_key_setup(self) -> None:
+        settings = self._log_output_settings
+        if settings is None or not settings.resume_key or not (settings.cfg_dir / KEY_CFG_NAME).is_file():
+            self._show_error("Save the log keys first.")
+            return
+        if self.worker is not None and self.worker.is_running:
+            self._show_error("Stop JOIN before applying key bindings.")
+            return
+        self.root.clipboard_clear()
+        self.root.clipboard_append("exec cs2_joiner_log_keys")
+        self._log("Copied: exec cs2_joiner_log_keys. Executing it replaces the selected keys' bindings and resumes recording.")
+
+    def _save_overlay_settings(self) -> None:
+        try:
+            save_overlay_settings(self.config_path, OverlaySettings(self.overlay_enabled_var.get(), self.overlay_position_var.get()))
+        except (OSError, ValueError) as exc:
+            self._show_error(str(exc))
+
+    def _update_game_overlay(self) -> None:
+        if self._closed:
+            return
+        try:
+            if not self.auto_retry_var.get():
+                self._advance_pending_join(None)
+                if self._log_overlay is not None:
+                    self._log_overlay.hide()
+                return
+            game = None
+            if self._log_output_required and not self._game_windows_error:
+                if self._game_windows is None:
+                    self._game_windows = GameWindows()
+                    self._resume_sender = ResumeKeySender(self._game_windows)
+                game = self._game_windows.foreground()
+            if game is not None:
+                if self._last_game_pid is not None and game.pid != self._last_game_pid and self._log_output_monitor is not None:
+                    self._log_output_monitor.expect_command("CS2 process changed. Confirm recording again before JOIN.",
+                                                            reset_keys=True)
+                self._last_game_pid = game.pid
+            self._advance_pending_join(game)
+            if self._log_overlay is None and game is not None and self.overlay_enabled_var.get():
+                self._log_overlay = LogStatusOverlay(self.root, self._game_windows)
+            if self._log_overlay is not None:
+                self._log_overlay.update(game, self.log_output_status_var.get(), self.overlay_position_var.get(),
+                                         self.overlay_enabled_var.get(), self.log_resume_note_var.get())
+        except (OSError, tk.TclError) as exc:
+            self._game_windows_error = True
+            if self._log_overlay is not None:
+                self._log_overlay.hide()
+            self._log(f"Game overlay/key input unavailable: {exc}. Manual log commands remain available.")
+        finally:
+            if not self._closed:
+                self.root.after(200, self._update_game_overlay)
+
+    def _advance_pending_join(self, game) -> None:
+        if self._pending_join is None or self._resume_request is None:
+            return
+        stage = self._resume_request.step(game, self._resume_sender) if self.auto_retry_var.get() else "ready"
+        if stage == "ready":
+            settings = replace(self._pending_join, auto_retry_enabled=self.auto_retry_var.get())
+            self._pending_join = None
+            self._resume_request = None
+            self._resume_stage = ""
+            self.log_resume_note_var.set("")
+            self._begin_auto_join(settings)
+            return
+        if stage == self._resume_stage:
+            return
+        self._resume_stage = stage
+        status, note, message = {
+            "foreground": ("LOG WAIT", "Resume queued", "JOIN is waiting for CS2 to be foreground with modifier keys released."),
+            "confirming": ("RESUMING", "Checking recording", "Resume key sent once. Waiting for CS2 log confirmation."),
+            "manual": ("MANUAL RESUME", "Manual resume needed", "JOIN is waiting: in the main menu run exec cs2_joiner_log_resume manually. To enable the resume key, run exec cs2_joiner_log_keys once in this tool session."),
+        }[stage]
+        self.status_var.set(status)
+        self.log_resume_note_var.set(note)
+        self._log(message)
+        if self._resume_request.error:
+            self._log(self._resume_request.error)
+
+    def _copy_log_output_command(self, state: str) -> None:
+        if self._log_output_settings is None or self._log_output_monitor is None:
+            self._show_error("Save log profiles and select console.log first.")
+            return
+        if self.worker is not None and self.worker.is_running:
+            self._show_error("Stop JOIN before manually changing log output.")
+            return
+        command = "exec " + CFG_NAMES[state][:-4]
+        self._log_output_monitor.expect_command()
+        self.root.clipboard_clear()
+        self.root.clipboard_append(command)
+        self._log(f"Copied: {command}. Run it in the CS2 console. Nothing was sent to the game.")
 
     def toggle_log_cleanup(self) -> None:
         enabled = self.log_cleanup_var.get()
@@ -278,8 +619,8 @@ class ZeJoinerApp(JoinerLayout):
         if self._closed:
             return
         self.root.after(10000, self._check_log_cleanup)
-        if (not self.log_cleanup_var.get() or self._cleanup_busy
-                or self.console_log_path is None or (self.worker is not None and self.worker.is_running)):
+        if (not self.auto_retry_var.get() or not self.log_cleanup_var.get() or self._cleanup_busy
+                or self.console_log_path is None or self._join_is_active()):
             return
         self._cleanup_busy = True
         self._cleanup_cancel = threading.Event()
@@ -305,7 +646,7 @@ class ZeJoinerApp(JoinerLayout):
     def _handle_cleanup_result(self, result: CleanupResult) -> None:
         self._cleanup_busy = False
         self.console_log_button.configure(state="normal")
-        self.join_button.configure(state="disabled" if self.worker is not None and self.worker.is_running else "normal")
+        self.join_button.configure(state="disabled" if self._join_is_active() else "normal")
         if result.message and result.message != self._cleanup_last_message:
             self._log(result.message)
         self._cleanup_last_message = result.message
@@ -618,6 +959,11 @@ class ZeJoinerApp(JoinerLayout):
             self._handle_cs2_mute_error(str(payload))
         elif kind == "log_cleanup" and isinstance(payload, CleanupResult):
             self._handle_cleanup_result(payload)
+        elif kind == "log_output":
+            generation, state, message = payload
+            if generation == self._log_output_generation:
+                self.log_output_status_var.set("PAUSED FLAGS" if state == "paused" else state.upper())
+                self._log(message)
 
     def _handle_discord_event(self, event: DiscordRpcWorkerEvent) -> None:
         self._debug("event discord", kind=event.kind, event_message=event.message)
@@ -691,6 +1037,7 @@ class ZeJoinerApp(JoinerLayout):
             kind=event.kind,
             event_message=event.message,
             error=event.error,
+            notify_sound=event.notify_sound,
             has_info=event.info is not None,
             map=event.info.map_name if event.info is not None else "",
             players=event.info.players if event.info is not None else None,
@@ -717,7 +1064,12 @@ class ZeJoinerApp(JoinerLayout):
         elif event.kind == "joining":
             self.status_var.set("JOINING")
         elif event.kind == "connect_requested":
-            self.status_var.set("CONNECTING")
+            self.status_var.set("REQUEST SENT" if event.notify_sound else "CONNECTING")
+            self._log(event.message)
+            if event.notify_sound:
+                self._play_join_sound()
+        elif event.kind == "tracking_disabled":
+            self.status_var.set("REQUEST SENT")
             self._log(event.message)
         elif event.kind == "retrying":
             self.status_var.set("RETRY WAIT")
@@ -737,9 +1089,10 @@ class ZeJoinerApp(JoinerLayout):
             self.status_var.set("JOINED")
             self._set_auto_buttons(is_running=False)
             self._start_server_monitor_if_possible("joined")
-            self._play_join_sound()
+            if event.notify_sound:
+                self._play_join_sound()
         elif event.kind == "stopped":
-            if self.status_var.get() not in ("JOINED", "ERROR", "UNCONFIRMED", "REJECTED FULL"):
+            if self.status_var.get() not in ("JOINED", "ERROR", "UNCONFIRMED", "REJECTED FULL", "REQUEST SENT"):
                 self.status_var.set("IDLE")
             self.worker = None
             self._set_auto_buttons(is_running=False)
@@ -932,7 +1285,7 @@ class ZeJoinerApp(JoinerLayout):
                 self._debug("server address save failed", reason=reason, address=str(address), error=repr(exc))
 
     def _start_server_monitor_if_possible(self, reason: str) -> None:
-        if self._closed or (self.worker is not None and self.worker.is_running):
+        if self._closed or self._join_is_active():
             return
         if not self.discord_enabled_var.get():
             self._debug("server monitor skipped; rpc disabled", reason=reason)
@@ -980,7 +1333,7 @@ class ZeJoinerApp(JoinerLayout):
         self.server_monitor = None
 
     def _set_auto_buttons(self, is_running: bool) -> None:
-        self.join_button.configure(state="disabled" if is_running or self._cleanup_busy else "normal")
+        self.join_button.configure(state="disabled" if is_running or (self._cleanup_busy and self.auto_retry_var.get()) else "normal")
         self.scan_button.configure(state="disabled" if is_running else "normal")
         self.stop_button.configure(state="normal" if is_running else "disabled")
 
@@ -1051,7 +1404,16 @@ class ZeJoinerApp(JoinerLayout):
         self.log.configure(state="disabled")
 
     def _close(self) -> None:
+        if self.auto_retry_var.get() and self._log_output_required and not self._log_output_ready():
+            if not messagebox.askyesno("CS2 Joiner", "CS2 logging is paused or unconfirmed. Exit anyway?\n\n"
+                                      "Restore it manually in CS2 with:\nexec cs2_joiner_log_resume\n\n"
+                                      "The tool does not restore logging automatically."):
+                return
         self._closed = True
+        if self._log_overlay is not None:
+            self._log_overlay.destroy()
+        if self._log_output_monitor is not None:
+            self._log_output_monitor.stop()
         self._cleanup_cancel.set()
         self._debug("close requested")
         self._save_request_rate()

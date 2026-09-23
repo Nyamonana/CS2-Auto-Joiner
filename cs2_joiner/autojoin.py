@@ -39,6 +39,7 @@ class AutoJoinEvent:
     info: ServerInfo | None = None
     error: str = ""
     address: ServerAddress | None = None
+    notify_sound: bool = False
 
 
 def validate_requests_per_second(value: int) -> int:
@@ -86,6 +87,7 @@ def safe_join_once(
         kind="connect_requested",
         message=f"Steam connect opened for {address}: {info.players}/{info.max_players}.",
         info=info,
+        notify_sound=True,
     )
 
 
@@ -105,6 +107,7 @@ class AutoJoinWorker:
         on_event: Callable[[AutoJoinEvent], None],
         wait_for_next: Callable[[float], bool] | None = None,
         connection_observer: ConsoleLogObserver | None = None,
+        connection_ready: Callable[[], bool] | None = None,
     ):
         self._client = client
         self._join_server = join_server
@@ -112,6 +115,7 @@ class AutoJoinWorker:
         self._on_event = on_event
         self._wait_for_next = wait_for_next
         self._connection_observer = connection_observer
+        self._connection_ready = connection_ready
         self._stop_event = threading.Event()
         self._retry_enabled = threading.Event()
         self.set_auto_retry_enabled(settings.auto_retry_enabled)
@@ -162,6 +166,8 @@ class AutoJoinWorker:
         )
         try:
             while not self._stop_event.is_set():
+                if not self._check_connection_ready():
+                    break
                 if self._retry_was_disabled():
                     break
                 started_at = time.perf_counter()
@@ -186,21 +192,34 @@ class AutoJoinWorker:
                         self._emit("joining", f"Slot detected: {info.players}/{info.max_players}.", info=info)
                         if self._stop_event.is_set() or self._retry_was_disabled():
                             break
-                        observer = self._connection_observer
+                        if not self._check_connection_ready():
+                            break
+                        observer = self._connection_observer if self._retry_enabled.is_set() else None
+                        if observer is None and self._retry_enabled.is_set():
+                            self._emit("unconfirmed", "CS2 connection log is unavailable. No connection was sent.")
+                            break
                         if observer is not None:
                             try:
                                 observer.begin(self.address)
                             except OSError as exc:
                                 self._emit("tracking_error", "CS2 log could not be opened.", error=str(exc))
+                                if self._retry_enabled.is_set():
+                                    self._emit("unconfirmed", "CS2 logging could not be verified. No connection was sent.")
+                                    break
                                 observer = None
                         if self._stop_event.is_set() or self._retry_was_disabled():
                             break
+                        track_result = self._retry_enabled.is_set()
                         try:
                             self._join_server(self._settings.address)
                         except Exception as exc:
                             self._emit("launch_error", "Steam connect could not be opened.", error=str(exc))
                             break
-                        self._emit("connect_requested", f"Steam connect opened for {self.address}; waiting for CS2 confirmation.", info=info)
+                        detail = "waiting for CS2 confirmation." if track_result else "auto retry is OFF; retry manually if needed."
+                        self._emit("connect_requested", f"Steam connect opened for {self.address}; {detail}",
+                                   info=info, notify_sound=not track_result)
+                        if not track_result:
+                            break
                         if not self._await_connection(observer, info):
                             break
 
@@ -211,6 +230,22 @@ class AutoJoinWorker:
         finally:
             self._emit("stopped", "Auto join stopped.")
 
+    def _check_connection_ready(self) -> bool:
+        if not self._retry_enabled.is_set() or self._connection_ready is None:
+            return True
+        try:
+            ready = self._connection_ready()
+        except Exception as exc:
+            if not self._retry_enabled.is_set():
+                return True
+            self._emit("unconfirmed", "CS2 log output check failed; no connection was sent.", error=str(exc))
+            return False
+        if not self._retry_enabled.is_set():
+            return True
+        if not ready:
+            self._emit("unconfirmed", "CS2 log output is paused or unknown. Run the resume command from Log output, then press JOIN again.")
+        return ready
+
     def _await_connection(self, observer: ConsoleLogObserver | None, info: ServerInfo) -> bool:
         if observer is None:
             self._emit("unconfirmed", "Result unavailable: select CS2 console.log and start CS2 with -condebug. No automatic retry.")
@@ -218,13 +253,19 @@ class AutoJoinWorker:
         deadline = time.monotonic() + self._settings.result_timeout_seconds
         timed_out = False
         while not self._stop_event.is_set():
+            if not self._retry_enabled.is_set():
+                break
             try:
                 result = observer.poll()
             except Exception as exc:
+                if not self._retry_enabled.is_set():
+                    break
                 self._emit("unconfirmed", "Connection tracking failed. Automatic retry is paused.", error=str(exc))
                 return False
             if self._stop_event.is_set():
                 return False
+            if not self._retry_enabled.is_set():
+                break
             if result is not None:
                 if result.kind == "full":
                     self._retry_pending = True
@@ -232,13 +273,18 @@ class AutoJoinWorker:
                         return False
                     self._emit("retrying", "CS2 rejected the connection: server full. Waiting for a fresh slot.")
                     return not self._stop_event.wait(self._settings.retry_delay_seconds)
-                self._emit(result.kind, result.message, info=info if result.kind == "joined" else None)
+                self._emit(result.kind, result.message, info=info if result.kind == "joined" else None,
+                           notify_sound=result.kind == "joined")
                 return False
             if not timed_out and time.monotonic() >= deadline:
                 self._emit("unconfirmed", "Connection result not yet confirmed. Still observing; no connection will be resent.")
                 timed_out = True
             self._stop_event.wait(0.05)
+        if not self._stop_event.is_set() and not self._retry_enabled.is_set():
+            self._emit("tracking_disabled", "Auto retry is OFF. Connection confirmation stopped; retry manually if needed.")
         return False
 
-    def _emit(self, kind: str, message: str, info: ServerInfo | None = None, error: str = "") -> None:
-        self._on_event(AutoJoinEvent(kind=kind, message=message, info=info, error=error, address=self.address))
+    def _emit(self, kind: str, message: str, info: ServerInfo | None = None, error: str = "",
+              *, notify_sound: bool = False) -> None:
+        self._on_event(AutoJoinEvent(kind=kind, message=message, info=info, error=error,
+                                    address=self.address, notify_sound=notify_sound))

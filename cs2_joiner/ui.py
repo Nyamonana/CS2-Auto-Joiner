@@ -4,6 +4,7 @@ import tkinter as tk
 from tkinter import ttk
 
 from .ui_icons import ICONS
+from .log_overlay import mode_style
 
 
 BG = "#111414"
@@ -88,6 +89,9 @@ class JoinerLayout:
         style.configure("Vertical.TScrollbar", background=LINE, troughcolor=BG, borderwidth=0,
                         arrowsize=11, arrowcolor=MUTED, lightcolor=LINE, darkcolor=LINE)
         style.map("Vertical.TScrollbar", background=[("active", MUTED)])
+        style.configure("Log.TNotebook", background=PANEL, borderwidth=0)
+        style.configure("Log.TNotebook.Tab", background=PANEL_2, foreground=MUTED, padding=(16, 9))
+        style.map("Log.TNotebook.Tab", background=[("selected", PANEL)], foreground=[("selected", CYAN)])
         self.root.option_add("*TCombobox*Listbox.background", PANEL_2)
         self.root.option_add("*TCombobox*Listbox.foreground", TEXT)
         self.root.option_add("*TCombobox*Listbox.selectBackground", CYAN)
@@ -156,7 +160,13 @@ class JoinerLayout:
         self._label(brand, "CS2", size=21, color=CYAN, bold=True).pack(side="left", padx=(0, 8))
         self._label(brand, "JOINER", size=21, bold=True).pack(side="left")
         self._rule(header).pack(side="left", fill="y", padx=20, pady=8)
-        self._label(header, "COMMUNITY SERVERS", size=9, color=MUTED).pack(side="left")
+        log_mode = tk.Frame(header, bg=BG)
+        log_mode.pack(side="left")
+        self._label(log_mode, "CONSOLE LOG", size=8, color=MUTED).pack(anchor="w")
+        self.log_mode_label = self._label(log_mode, size=11, mono=True, bold=True, width=15)
+        self.log_mode_label.pack(anchor="w", pady=(3, 0))
+        self.log_output_status_var.trace_add("write", self._render_log_mode)
+        self._render_log_mode()
         self.status_chip = tk.Label(header, textvariable=self.status_var, bg=PANEL_2, fg=MUTED,
             font=(MONO, 10, "bold"), padx=14, pady=7, width=16, anchor="center")
         self.status_chip.pack(side="right")
@@ -232,8 +242,15 @@ class JoinerLayout:
         self.threshold_entry = ttk.Spinbox(options, from_=0, to=128, textvariable=self.threshold_var, width=4, font=(MONO, 11))
         self.threshold_entry.grid(row=1, column=0, sticky="w")
         self._label(options, "or fewer", size=9, color=MUTED).grid(row=1, column=1, padx=(8, 4))
-        self.auto_retry_toggle = self._toggle(options, "Auto retry", self.auto_retry_var, self.toggle_auto_retry)
-        self.auto_retry_toggle.grid(row=2, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        retry = tk.Frame(options, bg=PANEL)
+        retry.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(6, 0))
+        self.auto_retry_toggle = self._toggle(retry, "Auto retry", self.auto_retry_var, self.toggle_auto_retry)
+        self.auto_retry_toggle.pack(side="left")
+        self._label(retry, "DEV", size=8, color=AMBER, bold=True).pack(side="left", padx=(3, 0))
+        self.retry_guide_button = self._button(retry, "", self.open_auto_retry_guide, PANEL, MUTED,
+                                              icon="terminal", tooltip="Auto retry guide (in development)")
+        self.retry_guide_button.configure(padx=4, pady=3)
+        self.retry_guide_button.pack(side="right")
 
         self._rule(parent).grid(row=5, column=0, sticky="ew", pady=(12, 10))
         self._label(parent, "GAME & LOG", size=8, color=MUTED, bold=True).grid(row=6, column=0, sticky="w", pady=(0, 8))
@@ -241,8 +258,16 @@ class JoinerLayout:
         tools.grid(row=7, column=0, sticky="ew")
         tools.grid_columnconfigure(0, weight=1)
         tools.grid_columnconfigure(1, weight=1)
-        self.cfg_button = self._button(tools, "Save GSI config", self.save_gsi_config, PANEL_2, TEXT, icon="file-down")
-        self.cfg_button.grid(row=0, column=0, columnspan=2, sticky="ew")
+        config_actions = tk.Frame(tools, bg=PANEL)
+        config_actions.grid(row=0, column=0, columnspan=2, sticky="ew")
+        config_actions.grid_columnconfigure(0, weight=1)
+        self.cfg_button = self._button(config_actions, "Save GSI config", self.save_gsi_config, PANEL_2, TEXT, icon="file-down")
+        self.cfg_button.grid(row=0, column=0, sticky="ew")
+        self.log_output_button = self._button(config_actions, "", self.open_log_output_settings,
+            PANEL_2, TEXT, icon="settings-2", tooltip=lambda: "Manual log output: " + self.log_output_status_var.get())
+        icon_size = self._icon("settings-2").width() + 4
+        self.log_output_button.configure(padx=2, pady=2, width=icon_size, height=icon_size)
+        self.log_output_button.grid(row=0, column=1, padx=(6, 0))
         self.cs2_mute_button = self._button(tools, "Mute CS2", self.toggle_cs2_mute, PANEL_2, TEXT, icon="volume-2")
         self.cs2_mute_button.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 0))
         self.console_log_button = self._button(tools, "CS2 log", self.choose_console_log, PANEL_2, TEXT, icon="folder-open")
@@ -378,13 +403,17 @@ class JoinerLayout:
     def _render_session_status(self, *args):
         status = self.status_var.get()
         color = MUTED
-        if status in ("AUTO", "JOINED", "JOINING", "CONNECTING"):
+        if status in ("AUTO", "JOINED", "JOINING", "CONNECTING", "REQUEST SENT"):
             color = CYAN
-        elif status in ("FULL", "RETRY WAIT", "UNCONFIRMED", "REJECTED FULL"):
+        elif status in ("FULL", "RETRY WAIT", "UNCONFIRMED", "REJECTED FULL", "LOG WAIT", "RESUMING", "MANUAL RESUME"):
             color = AMBER
         elif status == "ERROR":
             color = RED
         self.status_chip.configure(fg=color)
+
+    def _render_log_mode(self, *args):
+        text, color = mode_style(self.log_output_status_var.get())
+        self.log_mode_label.configure(text=text, fg=color)
 
     def _set_cs2_mute_button_busy(self):
         self.cs2_mute_button.configure(text="CS2 audio...", state="disabled", bg=PANEL_2, fg=MUTED)

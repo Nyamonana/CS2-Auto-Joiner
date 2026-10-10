@@ -32,35 +32,29 @@ class GsiSnapshot:
 
 
 class GsiConnectionObserver:
-    """Match only live in-game snapshots received after an attempt starts."""
+    """Latch fresh in-game GSI until the current auto-join run ends."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._target_map = ""
-        self._started_at = 0.0
-        self._received_at = 0.0
+        self._started_at: float | None = None
+        self._received_at: float | None = None
 
-    @staticmethod
-    def _map_key(name: str) -> str:
-        return name.replace("\\", "/").rsplit("/", 1)[-1].casefold().removesuffix(".bsp")
-
-    def begin(self, map_name: str) -> None:
+    def begin(self) -> None:
         with self._lock:
-            self._target_map = self._map_key(map_name)
             self._started_at = time.perf_counter()
-            self._received_at = 0.0
+            self._received_at = None
 
     def on_snapshot(self, snapshot: GsiSnapshot) -> None:
         received_at = time.perf_counter()
         with self._lock:
-            if (received_at >= self._started_at and self._target_map and snapshot.activity.casefold() != "menu"
-                    and self._map_key(snapshot.map_name) == self._target_map):
-                if not self._received_at:
+            if (self._started_at is not None and received_at >= self._started_at
+                    and snapshot.map_name.strip() and snapshot.activity.strip().casefold() != "menu"):
+                if self._received_at is None:
                     self._received_at = received_at
 
-    def poll(self, deadline: float | None = None) -> bool:
+    def poll(self) -> bool:
         with self._lock:
-            return bool(self._received_at) and (deadline is None or self._received_at <= deadline)
+            return self._received_at is not None
 
 
 @dataclass(frozen=True)

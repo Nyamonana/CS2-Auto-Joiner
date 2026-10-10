@@ -246,7 +246,8 @@ class JoinerLayout:
         basic_retry.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(6, 0))
         self.gsi_retry_toggle = self._toggle(basic_retry, "Auto retry", self.gsi_retry_var, self.toggle_gsi_retry)
         self.gsi_retry_toggle.pack(side="left")
-        Tooltip(self.gsi_retry_toggle, "No target-map GSI within 20 seconds: scan again. No console.log required. "
+        Tooltip(self.gsi_retry_toggle, "No in-game GSI within 20 seconds: scan again. New in-game GSI stops this JOIN run, "
+                "including during retry scans. No score or console.log required. GSI does not verify server IP. "
                 "Long loading can trigger a retry. Cannot be combined with Quick auto retry.")
         retry = tk.Frame(options, bg=PANEL)
         retry.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(2, 0))

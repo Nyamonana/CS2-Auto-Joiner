@@ -8,10 +8,14 @@ from .ui import AMBER, FONT, MUTED, PANEL, PANEL_2, TEXT
 
 SECTIONS = (
     ("Choose one retry mode", "Auto retry uses GSI, without console.log or -condebug. "
-     "After each JOIN request, it waits up to 20 seconds for a new in-game GSI snapshot matching the target map. "
-     "If none arrives, it assumes rejection and scans for a fresh slot again. GSI stays on even when RPC is off. "
+     "After each JOIN request, it waits up to 20 seconds for new in-game GSI with a non-empty map name. "
+     "If none arrives, it scans for a fresh slot again while still checking for late in-game GSI. "
+     "Receiving in-game GSI ends this JOIN run, even after the timeout or if the map has changed. "
+     "Score data is not required. Missing GSI afterward does not restart JOIN; press JOIN to start again. "
+     "GSI stays on even when RPC is off. "
      "Save GSI config if automatic installation is unavailable, and restart CS2 after installing the config. "
-     "Long downloads, loading, or missing GSI can also trigger this timeout; GSI map matching does not verify a server IP.\n"
+     "Long downloads, loading, or missing GSI can also trigger this timeout. GSI does not verify the server IP; "
+     "in-game GSI from a different server can also stop retries to avoid interrupting play.\n"
      "Quick auto retry (DEV) uses connection logs instead. Only one retry mode can be enabled at a time. "
      "The setup steps below apply only to Quick auto retry."),
     ("OFF and ON at a glance", "Quick auto retry is experimental.\n"

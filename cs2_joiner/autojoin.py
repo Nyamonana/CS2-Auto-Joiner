@@ -136,6 +136,7 @@ class AutoJoinWorker:
         self._gsi_retry_enabled = threading.Event()
         self.set_gsi_retry_enabled(settings.gsi_retry_enabled)
         self._retry_pending = False
+        self._gsi_attempt_started = False
         self._thread: threading.Thread | None = None
 
     @property
@@ -151,6 +152,7 @@ class AutoJoinWorker:
             raise RuntimeError("Auto join worker is already running.")
         self._stop_event.clear()
         self._retry_pending = False
+        self._gsi_attempt_started = False
         self._thread = threading.Thread(target=self._run, name="cs2-auto-join", daemon=True)
         self._thread.start()
 
@@ -197,6 +199,8 @@ class AutoJoinWorker:
                     break
                 if self._retry_was_disabled():
                     break
+                if self._finish_if_gsi_received():
+                    break
                 started_at = time.perf_counter()
                 try:
                     if self._settings.scan_interval_ms is not None:
@@ -211,11 +215,15 @@ class AutoJoinWorker:
                         info = self._client.query_info(self.address, timeout=self._settings.timeout_seconds)
                         received_at = time.perf_counter()
                 except Exception as exc:  # Network errors should not kill the loop.
+                    if self._finish_if_gsi_received():
+                        break
                     self._emit("error", "A2S query failed.", error=str(exc))
                 else:
                     if self._stop_event.is_set():
                         break
                     if self._retry_was_disabled():
+                        break
+                    if self._finish_if_gsi_received():
                         break
                     self._emit(
                         "info",
@@ -252,7 +260,12 @@ class AutoJoinWorker:
                             if self._gsi_observer is None:
                                 self._emit("unconfirmed", "GSI receiver is unavailable. No connection was sent.")
                                 break
-                            self._gsi_observer.begin(info.map_name)
+                            # Keep late success from earlier requests throughout this JOIN run.
+                            if not self._gsi_attempt_started:
+                                self._gsi_observer.begin()
+                                self._gsi_attempt_started = True
+                        if self._finish_if_gsi_received():
+                            break
                         if self._stop_event.is_set() or self._retry_was_disabled():
                             break
                         track_result = self._retry_enabled.is_set() or gsi_tracking
@@ -271,7 +284,7 @@ class AutoJoinWorker:
                         if not track_result:
                             break
                         if gsi_tracking:
-                            retry = self._await_gsi_connection(info, dispatch_at)
+                            retry = self._await_gsi_connection(dispatch_at)
                         else:
                             retry = self._await_connection(observer, info)
                         if not retry:
@@ -303,24 +316,32 @@ class AutoJoinWorker:
             self._emit("unconfirmed", "CS2 log output is paused or unknown. Run the resume command from Log output, then press JOIN again.")
         return ready
 
-    def _await_gsi_connection(self, info: ServerInfo, dispatch_at: float) -> bool:
+    def _finish_if_gsi_received(self) -> bool:
+        if (self._stop_event.is_set() or not self._gsi_retry_enabled.is_set()
+                or not self._gsi_attempt_started or self._gsi_observer is None):
+            return False
+        if not self._gsi_observer.poll():
+            return False
+        if self._stop_event.is_set() or not self._gsi_retry_enabled.is_set():
+            return False
+        self._emit("joined", "Fresh in-game GSI received. Auto join finished; no more requests will be sent. "
+                   "GSI does not verify the server IP.", notify_sound=True)
+        return True
+
+    def _await_gsi_connection(self, dispatch_at: float) -> bool:
         deadline = dispatch_at + self._settings.gsi_result_timeout_seconds
         self._emit("tracking", f"Waiting up to {self._settings.gsi_result_timeout_seconds:g} seconds "
-                   f"for fresh in-game GSI on {info.map_name}.")
+                   "for fresh in-game GSI. Late GSI will also stop retries while scanning.")
         while not self._stop_event.is_set() and self._gsi_retry_enabled.is_set():
-            if self._gsi_observer.poll(deadline):
-                if self._stop_event.is_set() or not self._gsi_retry_enabled.is_set():
-                    break
-                self._emit("joined", "Fresh in-game GSI received for the target map. Auto join finished.",
-                           info=info, notify_sound=True)
+            if self._finish_if_gsi_received():
                 return False
             remaining = deadline - time.perf_counter()
             if remaining <= 0:
                 self._retry_pending = True
                 if self._stop_event.is_set() or self._retry_was_disabled():
                     break
-                self._emit("retrying", f"No matching in-game GSI within {self._settings.gsi_result_timeout_seconds:g} seconds; assuming rejection "
-                           "and scanning for a fresh slot again.")
+                self._emit("retrying", f"No in-game GSI within {self._settings.gsi_result_timeout_seconds:g} seconds; "
+                           "scanning for a fresh slot again. Late in-game GSI will stop this JOIN run.")
                 return True
             self._stop_event.wait(min(0.05, remaining))
         if not self._stop_event.is_set() and not self._gsi_retry_enabled.is_set():

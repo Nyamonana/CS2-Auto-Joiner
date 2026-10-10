@@ -6,6 +6,7 @@ from pathlib import Path
 
 from .a2s import ServerAddress
 from .config_io import read_config, write_config
+from .slot_scan import validate_scan_interval_ms
 
 
 TARGET_CONFIG_SECTION = "Target"
@@ -13,6 +14,7 @@ TARGET_ADDRESS_KEY = "ServerAddress"
 JOIN_CONFIG_SECTION = "Join"
 REQUEST_RATE_KEY = "RequestRate"
 VALID_REQUEST_RATES = (1, 2, 3)
+SCAN_INTERVAL_KEY = "ScanIntervalMs"
 SOUND_CONFIG_SECTION = "Sound"
 SOUND_ENABLED_KEY = "Enabled"
 SOUND_FILE_KEY = "File"
@@ -55,6 +57,23 @@ def save_request_rate(path: Path, request_rate: int) -> None:
     write_config(path, parser)
 
 
+def load_scan_interval(path: Path, default: int = 100) -> int:
+    validate_scan_interval_ms(default)
+    try:
+        value = read_config(path).getint(JOIN_CONFIG_SECTION, SCAN_INTERVAL_KEY, fallback=default)
+        return validate_scan_interval_ms(value)
+    except ValueError:
+        return default
+
+
+def save_scan_interval(path: Path, interval_ms: int) -> None:
+    interval_ms = validate_scan_interval_ms(interval_ms)
+    parser = read_config(path)
+    _ensure_section(parser, JOIN_CONFIG_SECTION)
+    parser.set(JOIN_CONFIG_SECTION, SCAN_INTERVAL_KEY, str(interval_ms))
+    write_config(path, parser)
+
+
 def load_console_log_path(path: Path) -> str:
     return read_config(path).get(JOIN_CONFIG_SECTION, "ConsoleLogPath", fallback="").strip()
 
@@ -70,6 +89,24 @@ def save_auto_retry_enabled(path: Path, enabled: bool) -> None:
     parser = read_config(path)
     _ensure_section(parser, JOIN_CONFIG_SECTION)
     parser.set(JOIN_CONFIG_SECTION, "AutoRetry", "1" if enabled else "0")
+    if enabled:
+        parser.set(JOIN_CONFIG_SECTION, "GsiAutoRetry", "0")
+    write_config(path, parser)
+
+
+def load_gsi_retry_enabled(path: Path) -> bool:
+    try:
+        return read_config(path).getboolean(JOIN_CONFIG_SECTION, "GsiAutoRetry", fallback=False)
+    except ValueError:
+        return False
+
+
+def save_gsi_retry_enabled(path: Path, enabled: bool) -> None:
+    parser = read_config(path)
+    _ensure_section(parser, JOIN_CONFIG_SECTION)
+    parser.set(JOIN_CONFIG_SECTION, "GsiAutoRetry", "1" if enabled else "0")
+    if enabled:
+        parser.set(JOIN_CONFIG_SECTION, "AutoRetry", "0")
     write_config(path, parser)
 
 

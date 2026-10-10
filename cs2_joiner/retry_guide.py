@@ -7,8 +7,15 @@ from .ui import AMBER, FONT, MUTED, PANEL, PANEL_2, TEXT
 
 
 SECTIONS = (
-    ("OFF and ON at a glance", "Auto retry is experimental.\n"
-     "OFF: The tool scans for a free slot and sends one JOIN request. Log profiles, resume commands, "
+    ("Choose one retry mode", "Auto retry uses GSI, without console.log or -condebug. "
+     "After each JOIN request, it waits up to 20 seconds for a new in-game GSI snapshot matching the target map. "
+     "If none arrives, it assumes rejection and scans for a fresh slot again. GSI stays on even when RPC is off. "
+     "Save GSI config if automatic installation is unavailable, and restart CS2 after installing the config. "
+     "Long downloads, loading, or missing GSI can also trigger this timeout; GSI map matching does not verify a server IP.\n"
+     "Quick auto retry (DEV) uses connection logs instead. Only one retry mode can be enabled at a time. "
+     "The setup steps below apply only to Quick auto retry."),
+    ("OFF and ON at a glance", "Quick auto retry is experimental.\n"
+     "With both retry modes OFF: The tool scans for a free slot and sends one JOIN request. Log profiles, resume commands, "
      "and key setup are not required. The sound plays when the request is sent; it does not confirm entry. "
      "If CS2 rejects the connection, press JOIN again.\n"
      "ON: The tool reads CS2's log and scans again only after a confirmed server-full rejection. "
@@ -20,13 +27,13 @@ SECTIONS = (
      "consume disk space, and cause ongoing disk writes. Extra writes contribute to SSD wear over time; "
      "they do not mean that an SSD will be damaged immediately.\n"
      "The optional pause profile reduces logging from the channels captured in your snapshot after joining. "
-     "Keep recording enabled while connecting so Auto retry can identify a full rejection or a successful join. "
+     "Keep recording enabled while connecting so Quick auto retry can identify a full rejection or a successful join. "
      "New channels or output outside those channels may still be written to the log."),
     ("1. Set the CS2 launch option", "In Steam, open Counter-Strike 2 Properties and add the following "
      "to Launch Options. Keep your existing options and separate them with a space.\n\n"
      "-condebug\n\n"
      "Close and restart CS2. Enable the developer console in CS2's game settings and check which key opens it."),
-    ("2. Select console.log", "Turn Auto retry ON. If the log is not detected automatically, use CS2 log "
+    ("2. Select console.log", "Turn Quick auto retry ON. If the log is not detected automatically, use CS2 log "
      "in the tool to select console.log. You do not need to open the file in a text editor.\n\n"
      r"Typical location: ...\Counter-Strike Global Offensive\game\csgo\console.log"
      "\n\nIf the file does not exist, check -condebug and restart CS2. You can now enter the "
@@ -44,7 +51,7 @@ SECTIONS = (
      "in the CS2 console:\n\n"
      "exec cs2_joiner_log_keys\n\n"
      "This replaces the selected keys' existing bindings and resumes recording. Run it again after "
-     "starting the tool, re-enabling Auto retry, or restarting CS2 so the tool can confirm the bindings. "
+     "starting the tool, re-enabling Quick auto retry, or restarting CS2 so the tool can confirm the bindings. "
      "Use Game overlay to enable or disable the display and POSITION to place it."),
     ("5. Join, then pause logging manually", "With a pause profile configured, JOIN waits until RECORDING "
      "is confirmed. If CS2 is in the foreground and the resume key has been confirmed, the tool sends "
@@ -61,7 +68,7 @@ SECTIONS = (
      "When the tool confirms recording, a queued JOIN continues. If no JOIN is queued, press JOIN afterward. "
      "If RECORDING is already confirmed, you can start JOIN while CS2 remains in the background. "
      "The tool does not open the console or type commands into it."),
-    ("Switching OFF and troubleshooting", "Turning Auto retry OFF continues a queued JOIN in normal mode. "
+    ("Switching OFF and troubleshooting", "Turning Quick auto retry OFF continues a queued JOIN in normal mode. "
      "Log monitoring, resume key input, overlay display, and automatic log cleanup stop. It does not "
      "cancel a connection already sent or play a late notification sound. Turning it back ON stops "
      "an active JOIN; check the setup and press JOIN again.\n"
@@ -71,7 +78,7 @@ SECTIONS = (
      "If ON keeps waiting, verify the selected console.log, -condebug, and the resume command. "
      "After changing keys, select Save keys and run exec cs2_joiner_log_keys. If the log keeps growing "
      "after suppression, resume recording and capture a fresh channel list. If the connection result "
-     "remains unknown, use STOP or turn Auto retry OFF to return to manual retry."),
+     "remains unknown, use STOP or turn Quick auto retry OFF to return to manual retry."),
 )
 COMMANDS = ("-condebug", "log_dumpchannels", "exec cs2_joiner_log_keys",
             "exec cs2_joiner_log_resume", "exec cs2_joiner_log_pause")
@@ -80,7 +87,7 @@ COMMANDS = ("-condebug", "log_dumpchannels", "exec cs2_joiner_log_keys",
 class RetryGuide(tk.Toplevel):
     def __init__(self, root, open_settings, choose_log, make_button):
         super().__init__(root)
-        self.title("Auto retry guide")
+        self.title("Quick auto retry guide")
         self.configure(bg=PANEL)
         self.transient(root)
         width = min(800, max(320, root.winfo_screenwidth() - 80))
@@ -89,7 +96,7 @@ class RetryGuide(tk.Toplevel):
         self.minsize(min(560, width), min(420, height))
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(1, weight=1)
-        tk.Label(self, text="Auto retry / experimental", bg=PANEL, fg=AMBER,
+        tk.Label(self, text="Quick auto retry / experimental", bg=PANEL, fg=AMBER,
                  font=(FONT, 16, "bold"), anchor="w").grid(row=0, column=0, sticky="ew", padx=18, pady=(16, 12))
 
         content = tk.Frame(self, bg=PANEL)

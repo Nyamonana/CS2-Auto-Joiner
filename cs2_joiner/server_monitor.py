@@ -54,6 +54,10 @@ class ServerMonitorWorker:
         return self._settings.address
 
     @property
+    def interval_seconds(self) -> float:
+        return self._settings.interval_seconds
+
+    @property
     def is_running(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
 

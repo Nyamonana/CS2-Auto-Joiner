@@ -23,8 +23,10 @@ from .discord_rpc import (
     load_discord_config,
     save_discord_config,
 )
-from .gsi import GsiServer, GsiSnapshot, build_gsi_config, find_cs2_cfg_dirs, install_gsi_config
+from .gsi import GsiConnectionObserver, GsiServer, GsiSnapshot, build_gsi_config, find_cs2_cfg_dirs, install_gsi_config
 from .paths import application_directory
+from .obs_overlay import ObsOverlaySettings, ObsOverlayState, build_obs_lines, load_obs_settings, save_obs_settings
+from .obs_settings import ObsSettingsDialog
 from .log_cleanup import CleanupResult, LogCleanupManager
 from .log_output import (
     CFG_NAMES, KEY_CFG_NAME, LOG_KEYS, LogOutputMonitor, install_key_bindings, install_log_profiles,
@@ -36,16 +38,18 @@ from .retry_guide import RetryGuide
 from .server_monitor import ServerMonitorEvent, ServerMonitorSettings, ServerMonitorWorker
 from .server_target import (
     SoundSettings,
-    load_request_rate,
+    load_scan_interval,
     load_console_log_path,
     load_auto_retry_enabled,
+    load_gsi_retry_enabled,
     save_auto_retry_enabled,
+    save_gsi_retry_enabled,
     save_console_log_path,
     load_log_cleanup_enabled,
     save_log_cleanup_enabled,
     load_saved_server_address,
     load_sound_settings,
-    save_request_rate,
+    save_scan_interval,
     save_server_address,
     save_sound_settings,
 )
@@ -62,6 +66,7 @@ SCREEN_MARGIN = 40
 DISCORD_PENDING_RESEND_SECONDS = 2.0
 DISCORD_LIVE_RESEND_SECONDS = 15.0
 DISCORD_SERVER_REFRESH_SECONDS = 10.0
+OBS_SERVER_REFRESH_SECONDS = 2.0
 GSI_MAX_AGE_SECONDS = 45.0
 A2S_MAX_AGE_SECONDS = 30.0
 
@@ -84,8 +89,11 @@ class ZeJoinerApp(JoinerLayout):
         self.sound_by_name = {sound.name: sound for sound in self.sound_files}
         self.sound_settings = load_sound_settings(self.config_path, default_enabled=bool(self.sound_files))
         self.discord_config = load_discord_config(self.config_path)
+        self.obs_settings = load_obs_settings(self.config_path)
+        self.obs_state = ObsOverlayState()
+        self._obs_dialog: ObsSettingsDialog | None = None
         self.saved_server_address = load_saved_server_address(self.config_path)
-        self.saved_request_rate = load_request_rate(self.config_path)
+        self.saved_scan_interval = load_scan_interval(self.config_path)
         saved_log = load_console_log_path(self.config_path)
         candidates = [directory.parent / "console.log" for directory in find_cs2_cfg_dirs()]
         self.console_log_path = Path(saved_log) if saved_log else next((path for path in candidates if path.is_file()), None)
@@ -102,6 +110,7 @@ class ZeJoinerApp(JoinerLayout):
         self.last_discord_queue_time = 0.0
         self.worker: AutoJoinWorker | None = None
         self.gsi_server: GsiServer | None = None
+        self.gsi_observer = GsiConnectionObserver()
         self.events: queue.Queue[AutoJoinEvent | tuple[str, object]] = queue.Queue()
         self._closed = False
         self._scan_generation = 0
@@ -135,9 +144,10 @@ class ZeJoinerApp(JoinerLayout):
         overlay_settings = load_overlay_settings(self.config_path)
 
         self.address_var = tk.StringVar(value=self.saved_server_address)
-        self.request_rate_var = tk.IntVar(value=self.saved_request_rate)
+        self.scan_interval_var = tk.IntVar(value=self.saved_scan_interval)
         self.threshold_var = tk.IntVar(value=63)
-        self.auto_retry_var = tk.BooleanVar(value=load_auto_retry_enabled(self.config_path))
+        self.gsi_retry_var = tk.BooleanVar(value=load_gsi_retry_enabled(self.config_path))
+        self.auto_retry_var = tk.BooleanVar(value=load_auto_retry_enabled(self.config_path) and not self.gsi_retry_var.get())
         self.log_cleanup_var = tk.BooleanVar(value=load_log_cleanup_enabled(self.config_path))
         self.timeout_var = tk.DoubleVar(value=0.5)
         self.sound_enabled_var = tk.BooleanVar(value=bool(self.sound_files) and self.sound_settings.enabled)
@@ -146,6 +156,7 @@ class ZeJoinerApp(JoinerLayout):
         self.discord_large_image_var = tk.StringVar(value=self.discord_config.large_image)
         self.discord_small_image_var = tk.StringVar(value=self.discord_config.small_image)
         self.discord_enabled_var = tk.BooleanVar(value=self.discord_config.enabled)
+        self.obs_enabled_var = tk.BooleanVar(value=self.obs_settings.enabled)
 
         self.status_var = tk.StringVar(value="IDLE")
         self.server_var = tk.StringVar(value="-")
@@ -164,11 +175,16 @@ class ZeJoinerApp(JoinerLayout):
 
         self._build_style()
         self._build_layout()
+        self._restore_obs_target()
         self._set_auto_buttons(is_running=False)
         self._start_log_output_monitor()
         self._poll_events()
+        self._ensure_gsi_receiver()
+        self._publish_obs_state()
         self.root.protocol("WM_DELETE_WINDOW", self._close)
         self.root.after(100, self._restore_discord_rpc)
+        if self.obs_enabled_var.get():
+            self.root.after(150, lambda: self._start_server_monitor_if_possible("obs-startup"))
         self.root.after(1000, self._refresh_presence)
         self.root.after(10000, self._check_log_cleanup)
         self.root.after(200, self._update_game_overlay)
@@ -242,10 +258,11 @@ class ZeJoinerApp(JoinerLayout):
             address = parse_server_address(self.address_var.get())
             settings = AutoJoinSettings(
                 address=address,
-                requests_per_second=self.request_rate_var.get(),
+                scan_interval_ms=self.scan_interval_var.get(),
                 threshold_players=int(self.threshold_var.get()),
                 timeout_seconds=float(self.timeout_var.get()),
                 auto_retry_enabled=self.auto_retry_var.get(),
+                gsi_retry_enabled=self.gsi_retry_var.get(),
             )
         except (ValueError, tk.TclError) as exc:
             self._debug("auto join settings failed", error=str(exc))
@@ -253,7 +270,7 @@ class ZeJoinerApp(JoinerLayout):
             return
 
         if settings.auto_retry_enabled and self.console_log_path is None:
-            self._log("Auto retry needs CS2 console.log. Follow the setup guide, then press JOIN again.")
+            self._log("Quick auto retry needs CS2 console.log. Follow the setup guide, then press JOIN again.")
             self.open_auto_retry_guide()
             return
         if settings.auto_retry_enabled and self._log_output_required and not self._log_output_ready():
@@ -276,8 +293,12 @@ class ZeJoinerApp(JoinerLayout):
         self._begin_auto_join(settings)
 
     def _begin_auto_join(self, settings: AutoJoinSettings) -> None:
+        if settings.gsi_retry_enabled and not self._start_gsi_receiver(show_error=True):
+            self.status_var.set("GSI ERROR")
+            self._set_auto_buttons(is_running=False)
+            return
         address = settings.address
-        self._save_request_rate()
+        self._save_scan_interval()
         self._cleanup_generation += 1
         self._set_current_server_address(address, "join")
         self._scan_generation += 1
@@ -289,9 +310,10 @@ class ZeJoinerApp(JoinerLayout):
             lambda event: self.events.put(("auto", (generation, event))),
             connection_observer=ConsoleLogObserver(self.console_log_path) if settings.auto_retry_enabled and self.console_log_path else None,
             connection_ready=self._log_output_ready if settings.auto_retry_enabled and self._log_output_required else None,
+            gsi_observer=self.gsi_observer if settings.gsi_retry_enabled else None,
         )
         self.worker.start()
-        self._debug("auto join worker started", address=str(address), request_rate=settings.requests_per_second)
+        self._debug("auto join worker started", address=str(address), scan_interval_ms=settings.scan_interval_ms)
         self._set_auto_buttons(is_running=True)
 
     def stop_auto_join(self) -> None:
@@ -313,10 +335,14 @@ class ZeJoinerApp(JoinerLayout):
 
     def toggle_auto_retry(self) -> None:
         enabled = self.auto_retry_var.get()
+        if enabled:
+            self.gsi_retry_var.set(False)
+            if self.worker is not None:
+                self.worker.set_gsi_retry_enabled(False)
         if self.worker is not None:
             if enabled and self.worker.is_running:
                 self.worker.stop()
-                self._log("Auto retry enabled. Current JOIN stopped; finish setup and press JOIN again.")
+                self._log("Quick auto retry enabled. Current JOIN stopped; finish setup and press JOIN again.")
             else:
                 self.worker.set_auto_retry_enabled(enabled)
         self._cleanup_generation += 1
@@ -326,7 +352,7 @@ class ZeJoinerApp(JoinerLayout):
             save_auto_retry_enabled(self.config_path, enabled)
         except OSError as exc:
             self._log(f"Could not save auto retry setting: {exc}")
-        self._log(f"Auto retry: {'ON' if enabled else 'OFF'}")
+        self._log(f"Quick auto retry: {'ON' if enabled else 'OFF'}")
         self._start_log_output_monitor()
         if enabled:
             self.open_auto_retry_guide()
@@ -334,6 +360,23 @@ class ZeJoinerApp(JoinerLayout):
             if self._log_overlay is not None:
                 self._log_overlay.hide()
             self._advance_pending_join(None)
+        self._set_auto_buttons(is_running=self._join_is_active())
+
+    def toggle_gsi_retry(self) -> None:
+        enabled = self.gsi_retry_var.get()
+        if enabled:
+            # Stop before changing modes so no old attempt can dispatch or confirm late.
+            self.stop_auto_join()
+            if self.auto_retry_var.get():
+                self.auto_retry_var.set(False)
+                self.toggle_auto_retry()
+        elif self.worker is not None:
+            self.worker.set_gsi_retry_enabled(False)
+        try:
+            save_gsi_retry_enabled(self.config_path, enabled)
+        except OSError as exc:
+            self._log(f"Could not save auto retry setting: {exc}")
+        self._log(f"Auto retry: {'ON (20-second GSI check; press JOIN to start)' if enabled else 'OFF'}")
         self._set_auto_buttons(is_running=self._join_is_active())
 
     def _show_retry_guide_if_enabled(self) -> None:
@@ -570,7 +613,8 @@ class ZeJoinerApp(JoinerLayout):
             return
         stage = self._resume_request.step(game, self._resume_sender) if self.auto_retry_var.get() else "ready"
         if stage == "ready":
-            settings = replace(self._pending_join, auto_retry_enabled=self.auto_retry_var.get())
+            settings = replace(self._pending_join, auto_retry_enabled=self.auto_retry_var.get(),
+                               gsi_retry_enabled=self.gsi_retry_var.get())
             self._pending_join = None
             self._resume_request = None
             self._resume_stage = ""
@@ -694,8 +738,9 @@ class ZeJoinerApp(JoinerLayout):
 
         try:
             server = GsiServer(
-                lambda snapshot: self.events.put(("gsi", snapshot)),
+                self._receive_gsi,
                 debug_logger=self.debug_logger,
+                obs_state=self.obs_state,
             )
             server.start()
         except OSError as exc:
@@ -710,6 +755,60 @@ class ZeJoinerApp(JoinerLayout):
         self._debug("gsi started", uri=server.uri)
         self._install_gsi_config(server.uri)
         return True
+
+    def _receive_gsi(self, snapshot: GsiSnapshot) -> None:
+        self.gsi_observer.on_snapshot(snapshot)
+        self.events.put(("gsi", snapshot))
+
+    def _ensure_gsi_receiver(self) -> None:
+        if self._closed:
+            return
+        self._start_gsi_receiver()
+        self.root.after(5000, self._ensure_gsi_receiver)
+
+    def toggle_obs_overlay(self) -> None:
+        self.obs_settings = replace(self.obs_settings, enabled=self.obs_enabled_var.get())
+        self._restore_obs_target()
+        try:
+            save_obs_settings(self.config_path, self.obs_settings)
+        except OSError as exc:
+            self._log(f"Could not save OBS overlay setting: {exc}")
+        self._publish_obs_state()
+        self._start_server_monitor_if_possible("obs-toggle")
+        self._log(f"OBS overlay: {'ON' if self.obs_enabled_var.get() else 'OFF'}")
+
+    def copy_obs_url(self) -> None:
+        uri = self.gsi_server.uri if self.gsi_server is not None else "http://127.0.0.1:3000"
+        url = uri + "/obs"
+        self.root.clipboard_clear()
+        self.root.clipboard_append(url)
+        self._log(f"OBS URL copied: {url}")
+
+    def open_obs_settings(self) -> None:
+        if self._obs_dialog is not None and self._obs_dialog.winfo_exists():
+            self._obs_dialog.lift()
+            return
+        self._obs_dialog = ObsSettingsDialog(self.root, self.obs_settings, self._apply_obs_style, self._button)
+
+    def _apply_obs_style(self, settings: ObsOverlaySettings) -> None:
+        settings = replace(settings, enabled=self.obs_enabled_var.get())
+        save_obs_settings(self.config_path, settings)
+        self.obs_settings = settings
+        self._publish_obs_state()
+
+    def _publish_obs_state(self) -> None:
+        self.obs_state.publish(self.obs_settings, build_obs_lines(
+            self.current_server_address, self._current_server_info(), self._fresh_gsi_snapshot()))
+
+    def _restore_obs_target(self) -> None:
+        if (not self.obs_enabled_var.get() or self.current_server_address is not None
+                or self.address_var.get().strip() != self.saved_server_address):
+            return
+        try:
+            address = parse_server_address(self.saved_server_address)
+        except ValueError:
+            return
+        self._set_current_server_address(address, "obs-saved-target", save=False)
 
     def save_gsi_config(self) -> None:
         cfg_dirs = find_cs2_cfg_dirs()
@@ -866,7 +965,10 @@ class ZeJoinerApp(JoinerLayout):
         self.last_discord_activity_key = ""
         self.last_discord_queue_time = 0.0
         self.discord_status_var.set("OFF")
-        self._stop_server_monitor()
+        if self.obs_enabled_var.get() and not self._closed:
+            self._start_server_monitor_if_possible("rpc-disconnected")
+        else:
+            self._stop_server_monitor()
         if save_enabled:
             self._save_discord_settings(enabled=False)
 
@@ -884,11 +986,11 @@ class ZeJoinerApp(JoinerLayout):
         except OSError as exc:
             self._debug("discord settings save failed", error=repr(exc))
 
-    def _save_request_rate(self) -> None:
+    def _save_scan_interval(self) -> None:
         try:
-            save_request_rate(self.config_path, int(self.request_rate_var.get()))
+            save_scan_interval(self.config_path, int(self.scan_interval_var.get()))
         except (ValueError, tk.TclError, OSError) as exc:
-            self._debug("request rate save failed", error=repr(exc))
+            self._debug("scan interval save failed", error=repr(exc))
 
     def _poll_events(self) -> None:
         if self._closed:
@@ -1038,6 +1140,7 @@ class ZeJoinerApp(JoinerLayout):
             event_message=event.message,
             error=event.error,
             notify_sound=event.notify_sound,
+            timings=event.timings,
             has_info=event.info is not None,
             map=event.info.map_name if event.info is not None else "",
             players=event.info.players if event.info is not None else None,
@@ -1121,6 +1224,7 @@ class ZeJoinerApp(JoinerLayout):
         self.map_var.set(info.map_name)
         self.players_var.set(f"{info.players}/{info.max_players} ({info.free_slots} open)")
         self.ping_var.set(f"{info.ping_ms:.1f} ms")
+        self._publish_obs_state()
         self._update_presence_preview()
         self._sync_discord_current_activity("a2s")
 
@@ -1143,6 +1247,7 @@ class ZeJoinerApp(JoinerLayout):
             self.gsi_score_var.set("-")
         else:
             self.gsi_score_var.set(format_score(snapshot.score_ct, snapshot.score_t))
+        self._publish_obs_state()
         self._update_presence_preview()
         self._sync_discord_current_activity("gsi")
 
@@ -1169,6 +1274,9 @@ class ZeJoinerApp(JoinerLayout):
                 self.gsi_score_var.set("-")
             self._update_presence_preview()
             self._sync_discord_current_activity("refresh")
+            self._publish_obs_state()
+            if self.obs_enabled_var.get():
+                self._start_server_monitor_if_possible("obs-refresh")
         finally:
             self.root.after(1000, self._refresh_presence)
 
@@ -1259,6 +1367,8 @@ class ZeJoinerApp(JoinerLayout):
     def _resolve_server_address(self, reason: str, save: bool) -> ServerAddress | None:
         if self.current_server_address is not None:
             return self.current_server_address
+        if self.obs_enabled_var.get():
+            return None
         try:
             address = parse_server_address(self.address_var.get())
         except ValueError as exc:
@@ -1276,6 +1386,7 @@ class ZeJoinerApp(JoinerLayout):
             self.gsi_map_var.set("-")
             self.gsi_score_var.set("-")
             self._debug("current server address set", reason=reason, address=str(address))
+            self._publish_obs_state()
         if self.address_var.get().strip() != str(address):
             self.address_var.set(str(address))
         if save:
@@ -1287,8 +1398,9 @@ class ZeJoinerApp(JoinerLayout):
     def _start_server_monitor_if_possible(self, reason: str) -> None:
         if self._closed or self._join_is_active():
             return
-        if not self.discord_enabled_var.get():
-            self._debug("server monitor skipped; rpc disabled", reason=reason)
+        if not (self.discord_enabled_var.get() or self.obs_enabled_var.get()):
+            self._stop_server_monitor()
+            self._debug("server monitor skipped; rpc and obs disabled", reason=reason)
             return
 
         address = self._resolve_server_address(reason, save=True)
@@ -1296,8 +1408,9 @@ class ZeJoinerApp(JoinerLayout):
             self._debug("server monitor skipped; no address", reason=reason)
             return
 
+        interval = OBS_SERVER_REFRESH_SECONDS if self.obs_enabled_var.get() else DISCORD_SERVER_REFRESH_SECONDS
         if self.server_monitor is not None and self.server_monitor.is_running:
-            if self.server_monitor.address == address:
+            if self.server_monitor.address == address and self.server_monitor.interval_seconds == interval:
                 self._debug("server monitor already running", reason=reason, address=str(address))
                 return
             self._stop_server_monitor()
@@ -1305,7 +1418,7 @@ class ZeJoinerApp(JoinerLayout):
         try:
             settings = ServerMonitorSettings(
                 address=address,
-                interval_seconds=DISCORD_SERVER_REFRESH_SECONDS,
+                interval_seconds=interval,
                 timeout_seconds=float(self.timeout_var.get()),
             )
         except (ValueError, tk.TclError) as exc:
@@ -1336,6 +1449,8 @@ class ZeJoinerApp(JoinerLayout):
         self.join_button.configure(state="disabled" if is_running or (self._cleanup_busy and self.auto_retry_var.get()) else "normal")
         self.scan_button.configure(state="disabled" if is_running else "normal")
         self.stop_button.configure(state="normal" if is_running else "disabled")
+        for button in self.rate_buttons:
+            button.configure(state="disabled" if is_running else "normal")
 
     def _initial_sound_choice(self) -> str:
         if not self.sound_files:
@@ -1416,7 +1531,7 @@ class ZeJoinerApp(JoinerLayout):
             self._log_output_monitor.stop()
         self._cleanup_cancel.set()
         self._debug("close requested")
-        self._save_request_rate()
+        self._save_scan_interval()
         self._save_sound_settings()
         self.stop_auto_join()
         if self.gsi_server is not None:

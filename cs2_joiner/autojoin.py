@@ -8,20 +8,27 @@ from typing import Callable
 
 from .a2s import A2SClient, ServerAddress, ServerInfo
 from .connection import ConsoleLogObserver
+from .gsi import GsiConnectionObserver
+from .slot_scan import SlotScanner, validate_scan_interval_ms
 
 
 @dataclass(frozen=True)
 class AutoJoinSettings:
     address: ServerAddress
-    requests_per_second: int
+    requests_per_second: int = 3
     threshold_players: int = 63
     timeout_seconds: float = 0.5
     retry_delay_seconds: float = 0.5
     result_timeout_seconds: float = 60.0
     auto_retry_enabled: bool = False
+    scan_interval_ms: int | None = None
+    gsi_retry_enabled: bool = False
+    gsi_result_timeout_seconds: float = 20.0
 
     def __post_init__(self) -> None:
         validate_requests_per_second(self.requests_per_second)
+        if self.scan_interval_ms is not None:
+            validate_scan_interval_ms(self.scan_interval_ms)
         if self.threshold_players < 0:
             raise ValueError("Threshold players must not be negative.")
         if not math.isfinite(self.timeout_seconds) or self.timeout_seconds <= 0:
@@ -30,6 +37,10 @@ class AutoJoinSettings:
             raise ValueError("Retry delay must not be negative.")
         if not math.isfinite(self.result_timeout_seconds) or self.result_timeout_seconds <= 0:
             raise ValueError("Result timeout must be positive.")
+        if not math.isfinite(self.gsi_result_timeout_seconds) or self.gsi_result_timeout_seconds <= 0:
+            raise ValueError("GSI result timeout must be positive.")
+        if self.auto_retry_enabled and self.gsi_retry_enabled:
+            raise ValueError("Auto retry and Quick auto retry cannot be enabled together.")
 
 
 @dataclass(frozen=True)
@@ -40,6 +51,7 @@ class AutoJoinEvent:
     error: str = ""
     address: ServerAddress | None = None
     notify_sound: bool = False
+    timings: dict[str, float] | None = None
 
 
 def validate_requests_per_second(value: int) -> int:
@@ -108,6 +120,7 @@ class AutoJoinWorker:
         wait_for_next: Callable[[float], bool] | None = None,
         connection_observer: ConsoleLogObserver | None = None,
         connection_ready: Callable[[], bool] | None = None,
+        gsi_observer: GsiConnectionObserver | None = None,
     ):
         self._client = client
         self._join_server = join_server
@@ -116,9 +129,12 @@ class AutoJoinWorker:
         self._wait_for_next = wait_for_next
         self._connection_observer = connection_observer
         self._connection_ready = connection_ready
+        self._gsi_observer = gsi_observer
         self._stop_event = threading.Event()
         self._retry_enabled = threading.Event()
         self.set_auto_retry_enabled(settings.auto_retry_enabled)
+        self._gsi_retry_enabled = threading.Event()
+        self.set_gsi_retry_enabled(settings.gsi_retry_enabled)
         self._retry_pending = False
         self._thread: threading.Thread | None = None
 
@@ -148,10 +164,16 @@ class AutoJoinWorker:
             self._retry_enabled.clear()
 
     def _retry_was_disabled(self) -> bool:
-        if self._retry_pending and not self._retry_enabled.is_set():
+        if self._retry_pending and not (self._retry_enabled.is_set() or self._gsi_retry_enabled.is_set()):
             self._emit("full", "Server full. Auto retry is OFF; no further connection will be sent.")
             return True
         return False
+
+    def set_gsi_retry_enabled(self, enabled: bool) -> None:
+        if enabled:
+            self._gsi_retry_enabled.set()
+        else:
+            self._gsi_retry_enabled.clear()
 
     def wait(self, timeout: float | None = None) -> bool:
         if self._thread is not None:
@@ -159,11 +181,16 @@ class AutoJoinWorker:
         return not self.is_running
 
     def _run(self) -> None:
+        scan_rate = (f"{self._settings.scan_interval_ms} ms scan interval"
+                     if self._settings.scan_interval_ms is not None
+                     else f"{self._settings.requests_per_second} req/sec")
         self._emit(
             "started",
             f"Auto join started for {self._settings.address} "
-            f"({self._settings.requests_per_second} req/sec; auto retry {'ON' if self._retry_enabled.is_set() else 'OFF'}).",
+            f"({scan_rate}; auto retry {'ON' if self._gsi_retry_enabled.is_set() else 'OFF'}; "
+            f"quick auto retry {'ON' if self._retry_enabled.is_set() else 'OFF'}).",
         )
+        scanner = None
         try:
             while not self._stop_event.is_set():
                 if not self._check_connection_ready():
@@ -172,10 +199,17 @@ class AutoJoinWorker:
                     break
                 started_at = time.perf_counter()
                 try:
-                    info = self._client.query_info(
-                        self._settings.address,
-                        timeout=self._settings.timeout_seconds,
-                    )
+                    if self._settings.scan_interval_ms is not None:
+                        if scanner is None:
+                            scanner = SlotScanner(self._client, self.address, self._settings.scan_interval_ms,
+                                                  self._settings.timeout_seconds, self._stop_event)
+                        result = scanner.next_result()
+                        if result is None:
+                            break
+                        started_at, received_at, info = result
+                    else:
+                        info = self._client.query_info(self.address, timeout=self._settings.timeout_seconds)
+                        received_at = time.perf_counter()
                 except Exception as exc:  # Network errors should not kill the loop.
                     self._emit("error", "A2S query failed.", error=str(exc))
                 else:
@@ -187,8 +221,12 @@ class AutoJoinWorker:
                         "info",
                         format_server_scan_message(info, self._settings.threshold_players),
                         info=info,
+                        timings={"scan_ms": round((received_at - started_at) * 1000, 3)},
                     )
                     if should_join(info, threshold_players=self._settings.threshold_players):
+                        if scanner is not None:
+                            scanner.close()
+                            scanner = None
                         self._emit("joining", f"Slot detected: {info.players}/{info.max_players}.", info=info)
                         if self._stop_event.is_set() or self._retry_was_disabled():
                             break
@@ -209,7 +247,16 @@ class AutoJoinWorker:
                                 observer = None
                         if self._stop_event.is_set() or self._retry_was_disabled():
                             break
-                        track_result = self._retry_enabled.is_set()
+                        gsi_tracking = self._gsi_retry_enabled.is_set()
+                        if gsi_tracking:
+                            if self._gsi_observer is None:
+                                self._emit("unconfirmed", "GSI receiver is unavailable. No connection was sent.")
+                                break
+                            self._gsi_observer.begin(info.map_name)
+                        if self._stop_event.is_set() or self._retry_was_disabled():
+                            break
+                        track_result = self._retry_enabled.is_set() or gsi_tracking
+                        dispatch_at = time.perf_counter()
                         try:
                             self._join_server(self._settings.address)
                         except Exception as exc:
@@ -217,17 +264,27 @@ class AutoJoinWorker:
                             break
                         detail = "waiting for CS2 confirmation." if track_result else "auto retry is OFF; retry manually if needed."
                         self._emit("connect_requested", f"Steam connect opened for {self.address}; {detail}",
-                                   info=info, notify_sound=not track_result)
+                                   info=info, notify_sound=not track_result,
+                                   timings={"scan_ms": round((received_at - started_at) * 1000, 3),
+                                            "slot_to_dispatch_ms": round((dispatch_at - received_at) * 1000, 3),
+                                            "dispatch_ms": round((time.perf_counter() - dispatch_at) * 1000, 3)})
                         if not track_result:
                             break
-                        if not self._await_connection(observer, info):
+                        if gsi_tracking:
+                            retry = self._await_gsi_connection(info, dispatch_at)
+                        else:
+                            retry = self._await_connection(observer, info)
+                        if not retry:
                             break
 
-                sleep_seconds = compute_sleep_seconds(self._settings.requests_per_second, started_at)
-                wait_for_next = self._wait_for_next or self._stop_event.wait
-                if wait_for_next(sleep_seconds):
-                    break
+                if self._settings.scan_interval_ms is None:
+                    sleep_seconds = compute_sleep_seconds(self._settings.requests_per_second, started_at)
+                    wait_for_next = self._wait_for_next or self._stop_event.wait
+                    if wait_for_next(sleep_seconds):
+                        break
         finally:
+            if scanner is not None:
+                scanner.close()
             self._emit("stopped", "Auto join stopped.")
 
     def _check_connection_ready(self) -> bool:
@@ -245,6 +302,30 @@ class AutoJoinWorker:
         if not ready:
             self._emit("unconfirmed", "CS2 log output is paused or unknown. Run the resume command from Log output, then press JOIN again.")
         return ready
+
+    def _await_gsi_connection(self, info: ServerInfo, dispatch_at: float) -> bool:
+        deadline = dispatch_at + self._settings.gsi_result_timeout_seconds
+        self._emit("tracking", f"Waiting up to {self._settings.gsi_result_timeout_seconds:g} seconds "
+                   f"for fresh in-game GSI on {info.map_name}.")
+        while not self._stop_event.is_set() and self._gsi_retry_enabled.is_set():
+            if self._gsi_observer.poll(deadline):
+                if self._stop_event.is_set() or not self._gsi_retry_enabled.is_set():
+                    break
+                self._emit("joined", "Fresh in-game GSI received for the target map. Auto join finished.",
+                           info=info, notify_sound=True)
+                return False
+            remaining = deadline - time.perf_counter()
+            if remaining <= 0:
+                self._retry_pending = True
+                if self._stop_event.is_set() or self._retry_was_disabled():
+                    break
+                self._emit("retrying", f"No matching in-game GSI within {self._settings.gsi_result_timeout_seconds:g} seconds; assuming rejection "
+                           "and scanning for a fresh slot again.")
+                return True
+            self._stop_event.wait(min(0.05, remaining))
+        if not self._stop_event.is_set() and not self._gsi_retry_enabled.is_set():
+            self._emit("tracking_disabled", "Auto retry is OFF. No further connection will be sent.")
+        return False
 
     def _await_connection(self, observer: ConsoleLogObserver | None, info: ServerInfo) -> bool:
         if observer is None:
@@ -281,10 +362,10 @@ class AutoJoinWorker:
                 timed_out = True
             self._stop_event.wait(0.05)
         if not self._stop_event.is_set() and not self._retry_enabled.is_set():
-            self._emit("tracking_disabled", "Auto retry is OFF. Connection confirmation stopped; retry manually if needed.")
+            self._emit("tracking_disabled", "Quick auto retry is OFF. Connection confirmation stopped; retry manually if needed.")
         return False
 
     def _emit(self, kind: str, message: str, info: ServerInfo | None = None, error: str = "",
-              *, notify_sound: bool = False) -> None:
+              *, notify_sound: bool = False, timings: dict[str, float] | None = None) -> None:
         self._on_event(AutoJoinEvent(kind=kind, message=message, info=info, error=error,
-                                    address=self.address, notify_sound=notify_sound))
+                                    address=self.address, notify_sound=notify_sound, timings=timings))

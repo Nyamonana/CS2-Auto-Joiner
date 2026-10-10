@@ -132,7 +132,7 @@ class JoinerLayout:
         canvas.configure(yscrollcommand=scrollbar.set)
         canvas.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
-        shell = tk.Frame(canvas, bg=BG, padx=24, pady=18)
+        shell = tk.Frame(canvas, bg=BG, padx=24, pady=14)
         shell_window = canvas.create_window((0, 0), window=shell, anchor="nw")
 
         def sync(event=None):
@@ -154,7 +154,7 @@ class JoinerLayout:
         shell.grid_rowconfigure(4, weight=1)
 
         header = tk.Frame(shell, bg=BG)
-        header.grid(row=0, column=0, sticky="ew", pady=(0, 12))
+        header.grid(row=0, column=0, sticky="ew", pady=(0, 8))
         brand = tk.Frame(header, bg=BG)
         brand.pack(side="left")
         self._label(brand, "CS2", size=21, color=CYAN, bold=True).pack(side="left", padx=(0, 8))
@@ -179,7 +179,7 @@ class JoinerLayout:
         body.grid_columnconfigure(0, weight=28, uniform="workspace")
         body.grid_columnconfigure(2, weight=36, uniform="workspace")
         body.grid_columnconfigure(4, weight=36, uniform="workspace")
-        left = tk.Frame(body, bg=PANEL, padx=16, pady=14)
+        left = tk.Frame(body, bg=PANEL, padx=16, pady=10)
         left.grid(row=0, column=0, sticky="nsew")
         left.grid_columnconfigure(0, weight=1)
         self._rule(body).grid(row=0, column=1, sticky="ns", padx=18)
@@ -216,23 +216,23 @@ class JoinerLayout:
         self.stop_button.grid(row=0, column=2)
 
     def _build_controls(self, parent):
-        self._heading(parent, "Join settings", "settings-2").grid(row=0, column=0, sticky="ew", pady=(0, 14))
+        self._heading(parent, "Join settings", "settings-2").grid(row=0, column=0, sticky="ew", pady=(0, 10))
 
         rate = tk.Frame(parent, bg=PANEL)
-        rate.grid(row=2, column=0, sticky="ew", pady=(0, 12))
-        self._label(rate, "REQUEST RATE", size=8, color=MUTED, bold=True).pack(anchor="w", pady=(0, 6))
+        rate.grid(row=2, column=0, sticky="ew", pady=(0, 8))
+        self._label(rate, "SCAN INTERVAL", size=8, color=MUTED, bold=True).pack(anchor="w", pady=(0, 6))
         segments = tk.Frame(rate, bg=LINE, padx=1, pady=1)
         segments.pack(fill="x")
         self.rate_buttons = []
-        for value in (1, 2, 3):
-            button = tk.Radiobutton(segments, text=f"{value} / sec", variable=self.request_rate_var,
-                value=value, command=self._save_request_rate, indicatoron=False, selectcolor=PANEL_2,
+        for value in (100, 150, 200):
+            button = tk.Radiobutton(segments, text=f"{value} ms", variable=self.scan_interval_var,
+                value=value, command=self._save_scan_interval, indicatoron=False, selectcolor=PANEL_2,
                 bg=INPUT, fg=TEXT, activebackground=PANEL_2, activeforeground=CYAN,
                 font=(MONO, 10), padx=5, pady=6, bd=0, relief="flat", offrelief="flat",
                 highlightthickness=1, highlightbackground=INPUT, highlightcolor=CYAN, takefocus=True, cursor="hand2")
             button.pack(side="left", fill="x", expand=True, padx=1)
             self.rate_buttons.append(button)
-        self.request_rate_var.trace_add("write", self._render_rate)
+        self.scan_interval_var.trace_add("write", self._render_rate)
         self._render_rate()
 
         options = tk.Frame(parent, bg=PANEL)
@@ -242,18 +242,24 @@ class JoinerLayout:
         self.threshold_entry = ttk.Spinbox(options, from_=0, to=128, textvariable=self.threshold_var, width=4, font=(MONO, 11))
         self.threshold_entry.grid(row=1, column=0, sticky="w")
         self._label(options, "or fewer", size=9, color=MUTED).grid(row=1, column=1, padx=(8, 4))
+        basic_retry = tk.Frame(options, bg=PANEL)
+        basic_retry.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(6, 0))
+        self.gsi_retry_toggle = self._toggle(basic_retry, "Auto retry", self.gsi_retry_var, self.toggle_gsi_retry)
+        self.gsi_retry_toggle.pack(side="left")
+        Tooltip(self.gsi_retry_toggle, "No target-map GSI within 20 seconds: scan again. No console.log required. "
+                "Long loading can trigger a retry. Cannot be combined with Quick auto retry.")
         retry = tk.Frame(options, bg=PANEL)
-        retry.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(6, 0))
-        self.auto_retry_toggle = self._toggle(retry, "Auto retry", self.auto_retry_var, self.toggle_auto_retry)
+        retry.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(2, 0))
+        self.auto_retry_toggle = self._toggle(retry, "Quick auto retry", self.auto_retry_var, self.toggle_auto_retry)
         self.auto_retry_toggle.pack(side="left")
         self._label(retry, "DEV", size=8, color=AMBER, bold=True).pack(side="left", padx=(3, 0))
         self.retry_guide_button = self._button(retry, "", self.open_auto_retry_guide, PANEL, MUTED,
-                                              icon="terminal", tooltip="Auto retry guide (in development)")
+                                              icon="terminal", tooltip="Quick auto retry guide (in development)")
         self.retry_guide_button.configure(padx=4, pady=3)
         self.retry_guide_button.pack(side="right")
 
-        self._rule(parent).grid(row=5, column=0, sticky="ew", pady=(12, 10))
-        self._label(parent, "GAME & LOG", size=8, color=MUTED, bold=True).grid(row=6, column=0, sticky="w", pady=(0, 8))
+        self._rule(parent).grid(row=5, column=0, sticky="ew", pady=(8, 8))
+        self._label(parent, "GAME & LOG", size=8, color=MUTED, bold=True).grid(row=6, column=0, sticky="w", pady=(0, 6))
         tools = tk.Frame(parent, bg=PANEL)
         tools.grid(row=7, column=0, sticky="ew")
         tools.grid_columnconfigure(0, weight=1)
@@ -314,17 +320,28 @@ class JoinerLayout:
         self.rpc_settings_button = self._button(header, "", self.open_rpc_settings, BG, TEXT, icon="settings-2", tooltip="Discord RPC settings")
         self.rpc_settings_button.pack(side="right")
         self.discord_toggle = self._toggle(section, "RPC OFF", self.discord_enabled_var, self.toggle_discord_rpc)
-        self.discord_toggle.grid(row=1, column=0, sticky="w", pady=(0, 10))
+        self.discord_toggle.grid(row=1, column=0, sticky="w", pady=(0, 6))
         self._update_discord_toggle()
+        obs = tk.Frame(section, bg=BG)
+        obs.grid(row=2, column=0, sticky="ew", pady=(0, 6))
+        obs.grid_columnconfigure(0, weight=1)
+        self.obs_toggle = self._toggle(obs, "OBS overlay", self.obs_enabled_var, self.toggle_obs_overlay)
+        self.obs_toggle.grid(row=0, column=0, sticky="w")
+        self.obs_copy_button = self._button(obs, "Copy URL", self.copy_obs_url, PANEL_2, TEXT)
+        self.obs_copy_button.configure(font=(FONT, 9, "bold"), padx=6)
+        self.obs_copy_button.grid(row=0, column=1, padx=(4, 6))
+        self.obs_settings_button = self._button(obs, "", self.open_obs_settings, BG, TEXT,
+                                               icon="settings-2", tooltip="OBS overlay settings and setup")
+        self.obs_settings_button.grid(row=0, column=2)
         metrics = tk.Frame(section, bg=BG)
-        metrics.grid(row=2, column=0, sticky="ew")
+        metrics.grid(row=3, column=0, sticky="ew")
         metrics.grid_columnconfigure(0, weight=1)
         for row, (name, var) in enumerate((("GSI", self.gsi_status_var), ("LOCAL MAP", self.gsi_map_var),
                                          ("SCORE", self.gsi_score_var), ("DISCORD RPC", self.discord_status_var))):
             self._label(metrics, name, size=8, color=MUTED, bold=True).grid(row=row*2, column=0, sticky="w", pady=(0, 5))
-            self._value(metrics, var, size=10, mono=True).grid(row=row*2+1, column=0, sticky="ew", pady=(0, 13))
-        self._rule(section).grid(row=3, column=0, sticky="ew", pady=(0, 10))
-        self._value(section, self.presence_var, size=10, color=CYAN, lines=3).grid(row=4, column=0, sticky="ew")
+            self._value(metrics, var, size=10, mono=True).grid(row=row*2+1, column=0, sticky="ew", pady=(0, 3))
+        self._rule(section).grid(row=4, column=0, sticky="ew", pady=(0, 10))
+        self._value(section, self.presence_var, size=10, color=CYAN, lines=3).grid(row=5, column=0, sticky="ew")
 
     def _build_sound_controls(self, parent):
         strip = tk.Frame(parent, bg=BG)
@@ -397,8 +414,8 @@ class JoinerLayout:
         return button
 
     def _render_rate(self, *args):
-        for value, button in enumerate(self.rate_buttons, 1):
-            button.configure(fg=CYAN if self.request_rate_var.get() == value else MUTED)
+        for button in self.rate_buttons:
+            button.configure(fg=CYAN if self.scan_interval_var.get() == int(button.cget("value")) else MUTED)
 
     def _render_session_status(self, *args):
         status = self.status_var.get()

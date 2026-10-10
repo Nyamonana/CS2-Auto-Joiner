@@ -7,9 +7,12 @@ import os
 from pathlib import Path
 import re
 import threading
+import time
 from typing import Callable
+from urllib.parse import urlsplit
 
 from .debug_log import DebugLogger
+from .obs_overlay import OBS_HTML, ObsOverlayState
 
 
 CS2_APP_ID = "730"
@@ -26,6 +29,38 @@ class GsiSnapshot:
     phase: str = ""
     score_ct: int | None = None
     score_t: int | None = None
+
+
+class GsiConnectionObserver:
+    """Match only live in-game snapshots received after an attempt starts."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._target_map = ""
+        self._started_at = 0.0
+        self._received_at = 0.0
+
+    @staticmethod
+    def _map_key(name: str) -> str:
+        return name.replace("\\", "/").rsplit("/", 1)[-1].casefold().removesuffix(".bsp")
+
+    def begin(self, map_name: str) -> None:
+        with self._lock:
+            self._target_map = self._map_key(map_name)
+            self._started_at = time.perf_counter()
+            self._received_at = 0.0
+
+    def on_snapshot(self, snapshot: GsiSnapshot) -> None:
+        received_at = time.perf_counter()
+        with self._lock:
+            if (received_at >= self._started_at and self._target_map and snapshot.activity.casefold() != "menu"
+                    and self._map_key(snapshot.map_name) == self._target_map):
+                if not self._received_at:
+                    self._received_at = received_at
+
+    def poll(self, deadline: float | None = None) -> bool:
+        with self._lock:
+            return bool(self._received_at) and (deadline is None or self._received_at <= deadline)
 
 
 @dataclass(frozen=True)
@@ -58,7 +93,7 @@ def build_gsi_config(uri: str = "http://127.0.0.1:3000", token: str = "ze_joiner
   "timeout" "5.0"
   "buffer" "0.1"
   "throttle" "0.5"
-  "heartbeat" "30.0"
+  "heartbeat" "5.0"
   "auth"
   {{
     "token" "{token}"
@@ -133,11 +168,13 @@ class GsiServer:
         host: str = "127.0.0.1",
         port: int = 3000,
         debug_logger: DebugLogger | None = None,
+        obs_state: ObsOverlayState | None = None,
     ):
         self._on_snapshot = on_snapshot
         self._host = host
         self._port = port
         self._debug_logger = debug_logger
+        self._obs_state = obs_state or ObsOverlayState()
         self._server: _SnapshotHTTPServer | None = None
         self._thread: threading.Thread | None = None
 
@@ -147,7 +184,8 @@ class GsiServer:
 
     @property
     def uri(self) -> str:
-        return f"http://{self._host}:{self._port}"
+        port = self._server.server_address[1] if self._server is not None else self._port
+        return f"http://{self._host}:{port}"
 
     def start(self) -> None:
         if self.is_running:
@@ -159,6 +197,7 @@ class GsiServer:
             _GsiRequestHandler,
             self._on_snapshot,
             self._debug_logger,
+            self._obs_state,
         )
         self._server = server
         self._thread = threading.Thread(target=server.serve_forever, name="cs2-gsi", daemon=True)
@@ -180,14 +219,34 @@ class GsiServer:
 
 
 class _SnapshotHTTPServer(ThreadingHTTPServer):
-    def __init__(self, server_address, request_handler_class, on_snapshot, debug_logger):
+    def __init__(self, server_address, request_handler_class, on_snapshot, debug_logger, obs_state):
         super().__init__(server_address, request_handler_class)
         self.on_snapshot = on_snapshot
         self.debug_logger = debug_logger
+        self.obs_state = obs_state
 
 
 class _GsiRequestHandler(BaseHTTPRequestHandler):
     server: _SnapshotHTTPServer
+
+    def do_GET(self) -> None:
+        path = urlsplit(self.path).path
+        if path == "/obs":
+            body, content_type = OBS_HTML.encode("utf-8"), "text/html; charset=utf-8"
+        elif path == "/obs/state":
+            body, content_type = self.server.obs_state.read(), "application/json; charset=utf-8"
+        else:
+            self.send_error(404)
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Content-Security-Policy", "default-src 'none'; script-src 'unsafe-inline'; "
+                         "style-src 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'")
+        self.end_headers()
+        self.wfile.write(body)
 
     def do_POST(self) -> None:
         try:
